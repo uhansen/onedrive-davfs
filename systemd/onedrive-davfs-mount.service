@@ -1,0 +1,35 @@
+# onedrive-davfs mount unit.
+#
+# Mounts the WebDAV endpoint served by onedrive-davfs.service as a normal
+# directory via davfs2 (the kernel-side WebDAV filesystem client --
+# FUSE/mount() cannot be called from inside the wasm32-wasip2 sandbox, so
+# the component only ever speaks HTTP and davfs2 does the actual mounting).
+#
+# Install:
+#   mkdir -p ~/OneDrive
+#   cp systemd/onedrive-davfs-mount.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now onedrive-davfs-mount.service
+#
+# davfs2 needs the Basic auth credential in ~/.davfs2/secrets, e.g.:
+#   echo "http://127.0.0.1:8765/  daemon  <ONEDRIVE_BASIC_AUTH_SECRET value>" \
+#     >> ~/.davfs2/secrets
+#   chmod 600 ~/.davfs2/secrets
+#
+# An fstab entry is the more common way to drive davfs2 as a non-root user
+# (see README.md); this unit is the alternative for a fully systemd-managed
+# setup with an explicit ordering dependency on the daemon.
+
+[Unit]
+Description=Mount OneDrive via onedrive-davfs (davfs2)
+After=onedrive-davfs.service
+Requires=onedrive-davfs.service
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/mount.davfs http://127.0.0.1:8765/ %h/OneDrive -o rw,noexec,uid=%U
+ExecStop=/usr/bin/umount %h/OneDrive
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

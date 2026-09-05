@@ -1,0 +1,178 @@
+//! WebDAV verb handlers. Each function takes already-extracted request
+//! parts (path, depth, destination, body bytes) and returns
+//! `(status_code, content_type, body)` -- `lib.rs` is the only place that
+//! touches the raw `wasi:http` request/response resources.
+
+use crate::config::Config;
+use crate::graph;
+use crate::xml::{self, DavEntry};
+
+pub struct DavResponse {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: Vec<u8>,
+}
+
+impl DavResponse {
+    fn xml(status: u16, body: String) -> Self {
+        DavResponse {
+            status,
+            content_type: "application/xml; charset=utf-8",
+            body: body.into_bytes(),
+        }
+    }
+
+    fn empty(status: u16) -> Self {
+        DavResponse {
+            status,
+            content_type: "text/plain",
+            body: Vec::new(),
+        }
+    }
+
+    pub fn error(status: u16, message: impl Into<String>) -> Self {
+        DavResponse {
+            status,
+            content_type: "text/plain",
+            body: message.into().into_bytes(),
+        }
+    }
+}
+
+fn to_entry(path: &str, item: &graph::GraphItem) -> DavEntry {
+    let href = if path.is_empty() {
+        format!("/{}", item.name)
+    } else {
+        format!("{}/{}", path.trim_end_matches('/'), item.name)
+    };
+    DavEntry {
+        href,
+        is_dir: item.is_dir,
+        size: item.size,
+        last_modified: item.last_modified,
+        etag: item.etag.clone(),
+    }
+}
+
+/// `depth` is the raw `Depth` header value (`"0"`, `"1"`, `"infinity"`, or
+/// absent). Per RFC 4918, `infinity` is refused with `403` +
+/// `propfind-finite-depth` -- Graph has no cheap way to answer an
+/// unbounded recursive listing, and davfs2 never actually sends it anyway.
+pub fn propfind(config: &Config, path: &str, depth: Option<&str>) -> DavResponse {
+    if depth == Some("infinity") {
+        return DavResponse::xml(
+            403,
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>"#
+                .to_string(),
+        );
+    }
+
+    let self_item = match graph::stat(config, path) {
+        Ok(item) => item,
+        Err(e) if e == "not found" => return DavResponse::empty(404),
+        Err(e) => return DavResponse::error(502, e),
+    };
+
+    let mut entries = vec![to_entry(&parent_of(path), &self_item)];
+
+    if self_item.is_dir && depth != Some("0") {
+        match graph::children(config, path) {
+            Ok(children) => {
+                entries.extend(children.iter().map(|c| to_entry(path, c)));
+            }
+            Err(e) => return DavResponse::error(502, e),
+        }
+    }
+
+    DavResponse::xml(207, xml::multistatus(&entries))
+}
+
+fn parent_of(path: &str) -> String {
+    match path.trim_end_matches('/').rfind('/') {
+        Some(idx) => path[..idx].to_string(),
+        None => String::new(),
+    }
+}
+
+pub fn get(config: &Config, path: &str) -> DavResponse {
+    match graph::get_content(config, path) {
+        Ok(bytes) => DavResponse {
+            status: 200,
+            content_type: "application/octet-stream",
+            body: bytes,
+        },
+        Err(e) => DavResponse::error(502, e),
+    }
+}
+
+pub fn put(config: &Config, path: &str, body: &[u8]) -> DavResponse {
+    if body.len() as u64 > graph::MAX_SIMPLE_UPLOAD_BYTES {
+        return DavResponse::error(
+            507,
+            format!(
+                "file is {} bytes; this build only supports simple uploads up to {} bytes",
+                body.len(),
+                graph::MAX_SIMPLE_UPLOAD_BYTES
+            ),
+        );
+    }
+    match graph::put_content(config, path, body) {
+        Ok(()) => DavResponse::empty(201),
+        Err(e) => DavResponse::error(502, e),
+    }
+}
+
+pub fn mkcol(config: &Config, path: &str) -> DavResponse {
+    let parent = parent_of(path);
+    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path);
+    match graph::create_folder(config, &parent, name) {
+        Ok(()) => DavResponse::empty(201),
+        Err(e) => DavResponse::error(502, e),
+    }
+}
+
+pub fn delete(config: &Config, path: &str) -> DavResponse {
+    match graph::delete(config, path) {
+        Ok(()) => DavResponse::empty(204),
+        Err(e) => DavResponse::error(502, e),
+    }
+}
+
+/// `destination` is the decoded path portion of the `Destination` header
+/// (host/scheme already stripped by `lib.rs`).
+pub fn r#move(config: &Config, path: &str, destination: &str) -> DavResponse {
+    match graph::move_or_rename(config, path, destination) {
+        Ok(()) => DavResponse::empty(201),
+        Err(e) => DavResponse::error(502, e),
+    }
+}
+
+/// davfs2 requires `LOCK` to succeed to allow writes, but Graph has no
+/// native locking concept worth modeling for a single-writer mount, so
+/// this is a fixed no-op success response rather than a real lock grant.
+pub fn lock(_config: &Config, path: &str) -> DavResponse {
+    let body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<D:prop xmlns:D="DAV:">
+  <D:lockdiscovery>
+    <D:activelock>
+      <D:locktype><D:write/></D:locktype>
+      <D:lockscope><D:exclusive/></D:lockscope>
+      <D:depth>0</D:depth>
+      <D:owner>onedrive-davfs</D:owner>
+      <D:timeout>Second-3600</D:timeout>
+      <D:locktoken><D:href>opaquelocktoken:{token}</D:href></D:locktoken>
+      <D:lockroot><D:href>{href}</D:href></D:lockroot>
+    </D:activelock>
+  </D:lockdiscovery>
+</D:prop>"#,
+        token = xml::pct_encode(path),
+        href = xml::pct_encode(path),
+    );
+    DavResponse::xml(200, body)
+}
+
+pub fn unlock(_config: &Config, _path: &str) -> DavResponse {
+    DavResponse::empty(204)
+}
