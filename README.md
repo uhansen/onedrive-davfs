@@ -12,6 +12,9 @@ For a full install walkthrough, see [INSTALL.md](INSTALL.md).
 For notes on why this repo stays on WASI Preview 2 today, see
 [docs/wasip3-feasibility.md](docs/wasip3-feasibility.md).
 
+Prebuilt `.wasm` artifacts are published from GitHub Actions on `v*` tags.
+CI also builds and validates the component on pushes and pull requests.
+
 ## Why WebDAV instead of FUSE?
 
 WASI Preview 2 has no raw syscalls: no `/dev/fuse`, no `mount()`. A pure
@@ -237,7 +240,6 @@ wit/
 - No changes to the `onedrive-sync` Omarchy plugin. That plugin currently
   talks to `rclone mount`; teaching it to talk to this daemon instead (or
   in addition) is a deliberate follow-up, not part of this repo's scope.
-- No GitHub Actions / CI in this pass.
 
 ## License
 

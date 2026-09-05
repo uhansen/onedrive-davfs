@@ -3,30 +3,26 @@
 This guide walks through a full local installation of the `onedrive-davfs`
 component, from Azure app registration to a mounted `~/OneDrive` directory.
 
-## 1. Install prerequisites
+## 1. Install runtime prerequisites
 
-You need:
+For the normal install path, you only need:
 
-- Rust with the `wasm32-wasip2` target
-- `cargo-component`
 - `wasmtime`
 - `davfs2`
 - `curl`, `bash`, and `python3`
+- optional but recommended: `gh` for provenance verification
 
 Example on Debian/Ubuntu:
 
 ```sh
 sudo apt update
-sudo apt install -y davfs2 curl python3
-rustup target add wasm32-wasip2
-cargo install cargo-component
+sudo apt install -y davfs2 curl python3 gh
 ```
 
 Install `wasmtime` however you normally manage it, then confirm:
 
 ```sh
 wasmtime --version
-cargo component --version
 ```
 
 ## 2. Register an Azure app for OneDrive access
@@ -50,25 +46,40 @@ mount.
    - `User.Read`
 7. Copy the **Application (client) ID**. You will use it as `ONEDRIVE_CLIENT_ID`.
 
-## 3. Build the WebAssembly component
+## 3. Download the prebuilt WebAssembly component
 
-From the repository root:
-
-```sh
-cargo component build --release
-```
-
-The built component will be written to:
-
-```text
-target/wasm32-wasip1/release/onedrive_davfs.wasm
-```
-
-Optional validation:
+Create a place to install the downloaded artifact:
 
 ```sh
-cargo test --lib
-wasm-tools validate target/wasm32-wasip1/release/onedrive_davfs.wasm
+install -d ~/.local/share/onedrive-davfs
+```
+
+Set the release tag you want to install:
+
+```sh
+VERSION=v0.1.0
+```
+
+Download the component and checksum from GitHub Releases:
+
+```sh
+curl -L -o ~/.local/share/onedrive-davfs/onedrive_davfs.wasm \
+  "https://github.com/uhansen/onedrive-davfs/releases/download/${VERSION}/onedrive_davfs.wasm"
+curl -L -o /tmp/onedrive_davfs.wasm.sha256 \
+  "https://github.com/uhansen/onedrive-davfs/releases/download/${VERSION}/onedrive_davfs.wasm.sha256"
+```
+
+Verify the checksum:
+
+```sh
+(cd ~/.local/share/onedrive-davfs && sha256sum -c /tmp/onedrive_davfs.wasm.sha256)
+```
+
+Optional: verify GitHub build provenance:
+
+```sh
+gh attestation verify ~/.local/share/onedrive-davfs/onedrive_davfs.wasm \
+  --repo uhansen/onedrive-davfs
 ```
 
 ## 4. Perform the one-time OAuth device login
@@ -87,16 +98,11 @@ The script will print:
 
 Complete the sign-in in a browser and wait for the script to finish.
 
-## 5. Install the component and systemd files
-
-Create the local install directories and copy the files into place:
+## 5. Install the systemd files
 
 ```sh
-install -d ~/.local/share/onedrive-davfs
 install -d ~/.local/state/onedrive-davfs
 install -d ~/.config/systemd/user
-install -m 644 target/wasm32-wasip1/release/onedrive_davfs.wasm \
-  ~/.local/share/onedrive-davfs/
 install -m 644 systemd/onedrive-davfs.service ~/.config/systemd/user/
 install -m 644 systemd/onedrive-davfs-mount.service ~/.config/systemd/user/
 ```
@@ -255,3 +261,35 @@ Use:
 - `me/drive` for the signed-in account's primary drive
 - a specific drive ID for an exact target
 
+## 12. Alternative: build the component from source
+
+If you do not want to use a prebuilt release artifact, build it locally
+instead.
+
+Install the extra build prerequisites:
+
+- Rust with the `wasm32-wasip2` target
+- `cargo-component`
+- `wasm-tools`
+
+Example:
+
+```sh
+rustup target add wasm32-wasip2
+cargo install cargo-component
+cargo install wasm-tools
+```
+
+Build and validate:
+
+```sh
+cargo component build --release
+wasm-tools validate target/wasm32-wasip1/release/onedrive_davfs.wasm
+```
+
+Then copy the built component into place:
+
+```sh
+install -m 644 target/wasm32-wasip1/release/onedrive_davfs.wasm \
+  ~/.local/share/onedrive-davfs/
+```

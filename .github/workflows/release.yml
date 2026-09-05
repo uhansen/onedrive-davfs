@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+env:
+  COMPONENT_PATH: target/wasm32-wasip1/release/onedrive_davfs.wasm
+  CHECKSUM_PATH: target/wasm32-wasip1/release/onedrive_davfs.wasm.sha256
+  CARGO_COMPONENT_VERSION: 0.21.1
+  WASM_TOOLS_VERSION: 1.244.0
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-component
+        run: cargo install cargo-component --version "${CARGO_COMPONENT_VERSION}" --locked
+
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --version "${WASM_TOOLS_VERSION}" --locked
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+      - name: Check formatting for handwritten Rust sources
+        run: |
+          git ls-files '*.rs' \
+            | grep -v '^src/bindings.rs$' \
+            | xargs rustfmt --check --edition 2024 --config skip_children=true
+
+      - name: Build release component
+        run: cargo component build --release
+
+      - name: Validate WebAssembly component
+        run: wasm-tools validate "${COMPONENT_PATH}"
+
+      - name: Generate SHA256 checksum
+        run: sha256sum "${COMPONENT_PATH}" > "${CHECKSUM_PATH}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.COMPONENT_PATH }}
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.COMPONENT_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+          generate_release_notes: true
