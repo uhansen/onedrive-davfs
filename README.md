@@ -95,10 +95,16 @@ each expiry.
 mkdir -p ~/.local/share/onedrive-davfs ~/.local/state/onedrive-davfs
 cp target/wasm32-wasip1/release/onedrive_davfs.wasm ~/.local/share/onedrive-davfs/
 cp systemd/onedrive-davfs.service ~/.config/systemd/user/
-$EDITOR ~/.config/systemd/user/onedrive-davfs.service   # fill in ONEDRIVE_BASIC_AUTH_SECRET, and ONEDRIVE_CLIENT_ID if the daemon must refresh
+install -m 700 -d ~/.config/onedrive-davfs
+install -m 600 systemd/onedrive-davfs.env.example ~/.config/onedrive-davfs/env
+$EDITOR ~/.config/onedrive-davfs/env   # set ONEDRIVE_BASIC_AUTH_SECRET (openssl rand -base64 32), and ONEDRIVE_CLIENT_ID if the daemon must refresh
 systemctl --user daemon-reload
 systemctl --user enable --now onedrive-davfs.service
 ```
+
+> `wasmtime serve` does not inherit the host environment into the guest.
+> The unit therefore names each variable explicitly with `--env NAME`; if
+> you add new variables to the env file, add them to `ExecStart` as well.
 
 If you already have a valid `token.json` with a non-expired `access_token`,
 the daemon can start **without** `ONEDRIVE_CLIENT_ID` and use that token
@@ -150,17 +156,52 @@ wasm-tools validate target/wasm32-wasip1/release/onedrive_davfs.wasm
 cargo test --lib     # unit tests: date formatting, XML escaping, multistatus shape
 ```
 
-Manual smoke test once a token is in place:
+Manual smoke test once a token is in place (the daemon refuses to start
+without a real shared secret, so pass one here too):
 
 ```sh
+SECRET=$(openssl rand -base64 32)
 wasmtime serve --addr 127.0.0.1:8765 \
   -S cli=y \
   --dir ~/.local/state/onedrive-davfs::/state \
   --env ONEDRIVE_TENANT_ID=common \
   --env ONEDRIVE_CLIENT_ID=<id> \
+  --env ONEDRIVE_BASIC_AUTH_SECRET="$SECRET" \
   target/wasm32-wasip1/release/onedrive_davfs.wasm &
-curl -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8765/
+curl -u "daemon:$SECRET" -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8765/
 ```
+
+## Security model
+
+- **Loopback is not a trust boundary.** Every request must carry
+  `Authorization: Basic` with the password equal to
+  `ONEDRIVE_BASIC_AUTH_SECRET`. The daemon **fails closed**: it returns
+  `500` with a config error for every request if the secret is unset,
+  shorter than 16 characters, or a known placeholder (`REPLACE_ME`, ...).
+  Only `ONEDRIVE_ALLOW_UNAUTHENTICATED=1` disables this, for local
+  development; never use it on a multi-user machine. The comparison is
+  constant-time.
+- **Secrets never live in the unit file.** `onedrive-davfs.service` reads
+  `~/.config/onedrive-davfs/env` (mode 600) via `EnvironmentFile=`; the
+  same secret goes in `~/.davfs2/secrets` (mode 600).
+  `tools/device-code-login.sh` runs under `umask 077`, creates the state
+  directory `0700` and `token.json` `0600` atomically, and passes the token
+  response to `python3` over stdin (never argv).
+- **Paths are sanitised.** Request paths and `MOVE` `Destination` values
+  are percent-decoded, `.`/`..` segments and control characters are
+  rejected with `400`, and every segment is re-encoded before it is
+  interpolated into a Graph `root:/…:` address. Query strings are dropped.
+- **Outbound requests only go to Microsoft.** The HTTP client is
+  `https://`-only; the bearer token is attached only to
+  `graph.microsoft.com` requests (pagination `@odata.nextLink` values are
+  checked against that origin and capped at 500 pages); the pre-authenticated
+  `/content` download redirect is followed *without* the bearer.
+- **No token logging.** The component emits no log lines; Graph error
+  bodies are relayed to the client as `502` text but never include the
+  `Authorization` header or token endpoint payloads.
+- Request bodies are only read for `PUT` (`PROPFIND`/`LOCK` bodies are
+  ignored, so there is no XML parsing surface). `PUT` is capped at Graph's
+  simple-upload ceiling.
 
 ## Repo layout
 
@@ -178,6 +219,7 @@ tools/
   device-code-login.sh   native, one-time OAuth device code bootstrap
 systemd/
   onedrive-davfs.service         the daemon (wasmtime serve)
+  onedrive-davfs.env.example     template for ~/.config/onedrive-davfs/env (chmod 600)
   onedrive-davfs-mount.service   optional: davfs2 mount as its own unit
 wit/
   world.wit       component world (wasi:http/proxy + filesystem/cli imports)

@@ -11,15 +11,23 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now onedrive-davfs.service
 #
-# Required env vars (edit the Environment= lines below, or drop an
-# EnvironmentFile= pointing at a chmod 600 file instead):
-#   ONEDRIVE_CLIENT_ID          Azure AD app (client) ID
+# Configuration is read from a chmod-600 environment file (never from
+# Environment= lines in this unit, which would be world-readable and show
+# up in `systemctl --user show`):
+#   install -m 700 -d ~/.config/onedrive-davfs
+#   install -m 600 systemd/onedrive-davfs.env.example ~/.config/onedrive-davfs/env
+#   $EDITOR ~/.config/onedrive-davfs/env
+#
+# NOTE: `wasmtime serve` does NOT inherit the host environment into the
+# guest; each variable must be named with `--env NAME` on ExecStart below.
+#
+# Variables (see onedrive-davfs.env.example):
+#   ONEDRIVE_CLIENT_ID          Azure AD app (client) ID (needed for refresh)
 #   ONEDRIVE_TENANT_ID          defaults to "common" if unset
 #   ONEDRIVE_DRIVE_BASE         defaults to "me/drive" if unset
-#   ONEDRIVE_BASIC_AUTH_SECRET  shared secret davfs2 must send as the
-#                               HTTP Basic password (defense in depth,
-#                               since binding to loopback alone isn't
-#                               treated as a trust boundary here)
+#   ONEDRIVE_BASIC_AUTH_SECRET  REQUIRED shared secret (>= 16 chars) that
+#                               davfs2 must send as the HTTP Basic password.
+#                               The daemon refuses to serve without it.
 
 [Unit]
 Description=onedrive-davfs (Wasm WebDAV server for OneDrive via Microsoft Graph)
@@ -28,12 +36,11 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-Environment=ONEDRIVE_CLIENT_ID=REPLACE_ME
-Environment=ONEDRIVE_TENANT_ID=common
-Environment=ONEDRIVE_DRIVE_BASE=me/drive
-Environment=ONEDRIVE_BASIC_AUTH_SECRET=REPLACE_ME
+EnvironmentFile=%h/.config/onedrive-davfs/env
 ExecStart=%h/.local/bin/wasmtime serve \
     -S cli=y \
+    --env ONEDRIVE_CLIENT_ID --env ONEDRIVE_TENANT_ID \
+    --env ONEDRIVE_DRIVE_BASE --env ONEDRIVE_BASIC_AUTH_SECRET \
     --addr 127.0.0.1:8765 \
     --dir %h/.local/state/onedrive-davfs::/state \
     %h/.local/share/onedrive-davfs/onedrive_davfs.wasm

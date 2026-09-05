@@ -152,6 +152,27 @@ pub fn multistatus(entries: &[DavEntry]) -> String {
     )
 }
 
+/// Inverse of [`pct_encode`]: decodes `%XX` escapes and validates the
+/// result is UTF-8. Returns `None` on a malformed escape or invalid UTF-8.
+pub fn pct_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hi = (hex[0] as char).to_digit(16)?;
+            let lo = (hex[1] as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +239,18 @@ mod tests {
         let xml = multistatus(&[]);
         assert!(xml.contains("<D:multistatus xmlns:D=\"DAV:\">"));
         assert!(xml.trim_end().ends_with("</D:multistatus>"));
+    }
+
+    #[test]
+    fn pct_decode_round_trips_and_rejects_malformed() {
+        assert_eq!(pct_decode("report%201.docx").unwrap(), "report 1.docx");
+        assert_eq!(
+            pct_decode(&pct_encode("caf\u{e9} & co/x")).unwrap(),
+            "caf\u{e9} & co/x"
+        );
+        assert_eq!(pct_decode("plain").unwrap(), "plain");
+        assert!(pct_decode("bad%2").is_none());
+        assert!(pct_decode("bad%zz").is_none());
+        assert!(pct_decode("%ff").is_none());
     }
 }

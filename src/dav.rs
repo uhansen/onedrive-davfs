@@ -72,7 +72,7 @@ impl DavResponse {
 }
 
 fn to_entry(path: &str, item: &graph::GraphItem) -> DavEntry {
-    let href = if path.is_empty() {
+    let href = if path.trim_matches('/').is_empty() {
         format!("/{}", item.name)
     } else {
         format!("{}/{}", path.trim_end_matches('/'), item.name)
@@ -106,7 +106,12 @@ pub fn propfind(config: &Config, path: &str, depth: Option<&str>) -> DavResponse
         Err(e) => return DavResponse::error(502, e),
     };
 
-    let mut entries = vec![to_entry(&parent_of(path), &self_item)];
+    // The drive root is named "root" by Graph; its href must still be "/".
+    let mut self_entry = to_entry(&parent_of(path), &self_item);
+    if path.trim_matches('/').is_empty() {
+        self_entry.href = "/".to_string();
+    }
+    let mut entries = vec![self_entry];
 
     if self_item.is_dir && depth != Some("0") {
         match graph::children(config, path) {

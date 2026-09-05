@@ -13,6 +13,9 @@
 # Requires: bash, curl, python3 (for JSON parsing -- avoids a jq dependency).
 
 set -euo pipefail
+# Everything this script creates holds credentials: make it owner-only from
+# the moment of creation rather than relying on a later chmod.
+umask 077
 
 STATE_DIR="${1:-$HOME/.local/state/onedrive-davfs}"
 TENANT_ID="${2:-${ONEDRIVE_TENANT_ID:-common}}"
@@ -20,6 +23,7 @@ CLIENT_ID="${ONEDRIVE_CLIENT_ID:?Set ONEDRIVE_CLIENT_ID to your Azure AD app app
 SCOPES="offline_access Files.ReadWrite.All User.Read"
 
 mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
 TOKEN_FILE="$STATE_DIR/token.json"
 
 echo "Requesting device code from Azure AD (tenant: $TENANT_ID)..." >&2
@@ -67,17 +71,19 @@ while :; do
   esac
 done
 
-python3 - "$token_resp" "$TOKEN_FILE" <<'PY'
-import json, sys, time
-resp = json.loads(sys.argv[1])
+# Token JSON goes over stdin, never argv, so it is not visible in `ps`.
+python3 -c '
+import json, os, sys, time
+resp = json.load(sys.stdin)
 out = {
     "refresh_token": resp["refresh_token"],
     "access_token": resp["access_token"],
     "expires_at": int(time.time()) + int(resp.get("expires_in", 3600)) - 60,
 }
-with open(sys.argv[2], "w") as f:
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
     json.dump(out, f, indent=2)
-PY
-chmod 600 "$TOKEN_FILE"
+os.chmod(sys.argv[1], 0o600)
+' "$TOKEN_FILE" <<<"$token_resp"
 
 echo "Wrote $TOKEN_FILE. The onedrive-davfs daemon can now refresh from this token." >&2

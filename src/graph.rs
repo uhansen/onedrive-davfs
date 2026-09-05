@@ -164,6 +164,7 @@ pub fn children(config: &Config, path: &str) -> Result<Vec<GraphItem>, String> {
         item_path_segment(&config.drive_base, path)
     );
     let mut items = Vec::new();
+    let mut pages = 0usize;
     loop {
         let response = graph_request(config, Method::Get, &url, None, &[])?;
         if response.status != 200 {
@@ -176,13 +177,37 @@ pub fn children(config: &Config, path: &str) -> Result<Vec<GraphItem>, String> {
         let page: DriveItemPage = serde_json::from_slice(&response.body)
             .map_err(|e| format!("failed to parse children page: {e}"))?;
         items.extend(page.value.iter().map(to_item));
+        pages += 1;
         match page.next_link {
-            Some(next) => url = next,
+            Some(next) => url = validate_next_link(&next, pages)?,
             None => break,
         }
     }
     Ok(items)
 }
+
+/// Upper bound on pagination round-trips for a single listing (200 items
+/// per page => 100k entries), guarding against a runaway/cyclic link chain.
+const MAX_CHILDREN_PAGES: usize = 500;
+
+/// Only ever follow pagination links back to Graph itself: the bearer token
+/// is attached to every `graph_request`, so a link pointing anywhere else
+/// would leak it.
+fn validate_next_link(next: &str, pages_so_far: usize) -> Result<String, String> {
+    if pages_so_far >= MAX_CHILDREN_PAGES {
+        return Err(format!(
+            "graph children listing exceeded {MAX_CHILDREN_PAGES} pages; aborting"
+        ));
+    }
+    if !next.starts_with(GRAPH_ORIGIN) {
+        return Err(
+            "graph @odata.nextLink points outside graph.microsoft.com; refusing".to_string(),
+        );
+    }
+    Ok(next.to_string())
+}
+
+const GRAPH_ORIGIN: &str = "https://graph.microsoft.com/";
 
 pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
     let url = format!(
@@ -379,6 +404,17 @@ mod tests {
         assert_eq!(
             item_path_segment("me/drive", "/Documents/report 1.docx"),
             "/me/drive/root:/Documents/report%201.docx:"
+        );
+    }
+
+    #[test]
+    fn next_link_must_stay_on_graph_origin() {
+        assert!(validate_next_link("https://graph.microsoft.com/v1.0/x?skip=1", 1).is_ok());
+        assert!(validate_next_link("https://evil.example/steal", 1).is_err());
+        assert!(validate_next_link("http://graph.microsoft.com/v1.0/x", 1).is_err());
+        assert!(validate_next_link("https://graph.microsoft.com.evil/x", 1).is_err());
+        assert!(
+            validate_next_link("https://graph.microsoft.com/v1.0/x", MAX_CHILDREN_PAGES).is_err()
         );
     }
 }
