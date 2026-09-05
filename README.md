@@ -9,6 +9,8 @@ Linux, and is the intended eventual backend for the
 below).
 
 For a full install walkthrough, see [INSTALL.md](INSTALL.md).
+For notes on why this repo stays on WASI Preview 2 today, see
+[docs/wasip3-feasibility.md](docs/wasip3-feasibility.md).
 
 ## Why WebDAV instead of FUSE?
 
