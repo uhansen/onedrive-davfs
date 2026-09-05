@@ -237,5 +237,4 @@ wit/
 
 ## License
 
-Not yet decided for this repo; ask before assuming any particular license
-applies.
+MIT — see [LICENSE](LICENSE).
