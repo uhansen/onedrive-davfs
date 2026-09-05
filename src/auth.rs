@@ -61,13 +61,17 @@ fn save(config: &Config, token: &TokenFile) -> Result<(), String> {
 }
 
 fn refresh(config: &Config, refresh_token: &str) -> Result<TokenFile, String> {
+    let client_id = config
+        .client_id
+        .as_deref()
+        .ok_or("missing required env var ONEDRIVE_CLIENT_ID for token refresh")?;
     let url = format!(
         "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
         config.tenant_id
     );
     let form = format!(
         "client_id={}&grant_type=refresh_token&refresh_token={}&scope={}",
-        urlencode(&config.client_id),
+        urlencode(client_id),
         urlencode(refresh_token),
         urlencode("offline_access Files.ReadWrite.All User.Read"),
     );
@@ -105,15 +109,14 @@ fn refresh(config: &Config, refresh_token: &str) -> Result<TokenFile, String> {
 pub fn bearer_token(config: &Config) -> Result<String, String> {
     let mut token = load(config)?;
 
-    let needs_refresh = match &token.access_token {
-        Some(_) => now_secs() >= token.expires_at,
-        None => true,
-    };
-
-    if needs_refresh {
-        token = refresh(config, &token.refresh_token)?;
-        save(config, &token)?;
+    if let Some(access_token) = token.access_token.as_ref() {
+        if now_secs() < token.expires_at {
+            return Ok(format!("Bearer {access_token}"));
+        }
     }
+
+    token = refresh(config, &token.refresh_token)?;
+    save(config, &token)?;
 
     Ok(format!(
         "Bearer {}",

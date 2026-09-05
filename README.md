@@ -95,10 +95,15 @@ each expiry.
 mkdir -p ~/.local/share/onedrive-davfs ~/.local/state/onedrive-davfs
 cp target/wasm32-wasip1/release/onedrive_davfs.wasm ~/.local/share/onedrive-davfs/
 cp systemd/onedrive-davfs.service ~/.config/systemd/user/
-$EDITOR ~/.config/systemd/user/onedrive-davfs.service   # fill in ONEDRIVE_CLIENT_ID / ONEDRIVE_BASIC_AUTH_SECRET
+$EDITOR ~/.config/systemd/user/onedrive-davfs.service   # fill in ONEDRIVE_BASIC_AUTH_SECRET, and ONEDRIVE_CLIENT_ID if the daemon must refresh
 systemctl --user daemon-reload
 systemctl --user enable --now onedrive-davfs.service
 ```
+
+If you already have a valid `token.json` with a non-expired `access_token`,
+the daemon can start **without** `ONEDRIVE_CLIENT_ID` and use that token
+directly. `ONEDRIVE_CLIENT_ID` becomes mandatory only when the daemon needs
+to refresh an expired token.
 
 ### 4. Mount with davfs2
 
@@ -145,7 +150,8 @@ Manual smoke test once a token is in place:
 ```sh
 wasmtime serve --addr 127.0.0.1:8765 \
   --dir ~/.local/state/onedrive-davfs::/state \
-  --env ONEDRIVE_CLIENT_ID=<id> --env ONEDRIVE_TENANT_ID=common \
+  --env ONEDRIVE_TENANT_ID=common \
+  --env ONEDRIVE_CLIENT_ID=<id> \
   target/wasm32-wasip1/release/onedrive_davfs.wasm &
 curl -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8765/
 ```

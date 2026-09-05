@@ -11,7 +11,7 @@ use crate::bindings::wasi::filesystem::preopens;
 use crate::bindings::wasi::filesystem::types::Descriptor;
 
 pub struct Config {
-    pub client_id: String,
+    pub client_id: Option<String>,
     pub tenant_id: String,
     pub drive_base: String,
     pub basic_auth_secret: Option<String>,
@@ -28,11 +28,11 @@ fn env(name: &str) -> Option<String> {
 }
 
 impl Config {
-    /// Loads configuration, returning a human-readable error describing
-    /// exactly which required setting is missing.
+    /// Loads configuration from the environment and preopens. A client id
+    /// is optional at startup so a pre-seeded, still-valid access token can
+    /// be used immediately; only token refresh requires `ONEDRIVE_CLIENT_ID`.
     pub fn load() -> Result<Self, String> {
-        let client_id = env("ONEDRIVE_CLIENT_ID")
-            .ok_or("missing required env var ONEDRIVE_CLIENT_ID")?;
+        let client_id = env("ONEDRIVE_CLIENT_ID");
         let tenant_id = env("ONEDRIVE_TENANT_ID").unwrap_or_else(|| "common".to_string());
         let drive_base =
             env("ONEDRIVE_DRIVE_BASE").unwrap_or_else(|| "me/drive".to_string());

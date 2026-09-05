@@ -446,6 +446,30 @@ pub mod wasi {
         }
     }
     pub mod filesystem {
+        /// WASI filesystem is a filesystem API primarily intended to let users run WASI
+        /// programs that access their files on their existing filesystems, without
+        /// significant overhead.
+        ///
+        /// It is intended to be roughly portable between Unix-family platforms and
+        /// Windows, though it does not hide many of the major differences.
+        ///
+        /// Paths are passed as interface-type `string`s, meaning they must consist of
+        /// a sequence of Unicode Scalar Values (USVs). Some filesystems may contain
+        /// paths which are not accessible by this API.
+        ///
+        /// The directory separator in WASI is always the forward-slash (`/`).
+        ///
+        /// All paths in WASI are relative paths, and are interpreted relative to a
+        /// `descriptor` referring to a base directory. If a `path` argument to any WASI
+        /// function starts with `/`, or if any step of resolving a `path`, including
+        /// `..` and symbolic link steps, reaches a directory outside of the base
+        /// directory, or reaches a symlink to an absolute or rooted path in the
+        /// underlying filesystem, the function fails with `error-code::not-permitted`.
+        ///
+        /// For more information about WASI path resolution and sandboxing, see
+        /// [WASI filesystem path resolution].
+        ///
+        /// [WASI filesystem path resolution]: https://github.com/WebAssembly/wasi-filesystem/blob/main/path-resolution.md
         #[allow(dead_code, async_fn_in_trait, unused_imports, clippy::all)]
         pub mod types {
             #[used]
@@ -456,17 +480,30 @@ pub mod wasi {
             pub type OutputStream = super::super::super::wasi::io::streams::OutputStream;
             pub type Error = super::super::super::wasi::io::streams::Error;
             pub type Datetime = super::super::super::wasi::clocks::wall_clock::Datetime;
+            /// File size or length of a region within a file.
             pub type Filesize = u64;
+            /// The type of a filesystem object referenced by a descriptor.
+            ///
+            /// Note: This was called `filetype` in earlier versions of WASI.
             #[repr(u8)]
             #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
             pub enum DescriptorType {
+                /// The type of the descriptor or file is unknown or is different from
+                /// any of the other types specified.
                 Unknown,
+                /// The descriptor refers to a block device inode.
                 BlockDevice,
+                /// The descriptor refers to a character device inode.
                 CharacterDevice,
+                /// The descriptor refers to a directory inode.
                 Directory,
+                /// The descriptor refers to a named pipe.
                 Fifo,
+                /// The file refers to a symbolic link inode.
                 SymbolicLink,
+                /// The descriptor refers to a regular file inode.
                 RegularFile,
+                /// The descriptor refers to a socket.
                 Socket,
             }
             impl ::core::fmt::Debug for DescriptorType {
@@ -522,29 +559,98 @@ pub mod wasi {
                 }
             }
             wit_bindgen_rt::bitflags::bitflags! {
+                #[doc = " Descriptor flags."] #[doc = ""] #[doc =
+                " Note: This was called `fdflags` in earlier versions of WASI."]
                 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)] pub
-                struct DescriptorFlags : u8 { const READ = 1 << 0; const WRITE = 1 << 1;
-                const FILE_INTEGRITY_SYNC = 1 << 2; const DATA_INTEGRITY_SYNC = 1 << 3;
-                const REQUESTED_WRITE_SYNC = 1 << 4; const MUTATE_DIRECTORY = 1 << 5; }
+                struct DescriptorFlags : u8 { #[doc = " Read mode: Data can be read."]
+                const READ = 1 << 0; #[doc = " Write mode: Data can be written to."]
+                const WRITE = 1 << 1; #[doc =
+                " Request that writes be performed according to synchronized I/O file"]
+                #[doc =
+                " integrity completion. The data stored in the file and the file's"]
+                #[doc =
+                " metadata are synchronized. This is similar to `O_SYNC` in POSIX."]
+                #[doc = ""] #[doc =
+                " The precise semantics of this operation have not yet been defined for"]
+                #[doc =
+                " WASI. At this time, it should be interpreted as a request, and not a"]
+                #[doc = " requirement."] const FILE_INTEGRITY_SYNC = 1 << 2; #[doc =
+                " Request that writes be performed according to synchronized I/O data"]
+                #[doc = " integrity completion. Only the data stored in the file is"]
+                #[doc = " synchronized. This is similar to `O_DSYNC` in POSIX."] #[doc =
+                ""] #[doc =
+                " The precise semantics of this operation have not yet been defined for"]
+                #[doc =
+                " WASI. At this time, it should be interpreted as a request, and not a"]
+                #[doc = " requirement."] const DATA_INTEGRITY_SYNC = 1 << 3; #[doc =
+                " Requests that reads be performed at the same level of integrity"] #[doc
+                = " requested for writes. This is similar to `O_RSYNC` in POSIX."] #[doc
+                = ""] #[doc =
+                " The precise semantics of this operation have not yet been defined for"]
+                #[doc =
+                " WASI. At this time, it should be interpreted as a request, and not a"]
+                #[doc = " requirement."] const REQUESTED_WRITE_SYNC = 1 << 4; #[doc =
+                " Mutating directories mode: Directory contents may be mutated."] #[doc =
+                ""] #[doc =
+                " When this flag is unset on a descriptor, operations using the"] #[doc =
+                " descriptor which would create, rename, delete, modify the data or"]
+                #[doc =
+                " metadata of filesystem objects, or obtain another handle which"] #[doc
+                =
+                " would permit any of those, shall fail with `error-code::read-only` if"]
+                #[doc = " they would otherwise succeed."] #[doc = ""] #[doc =
+                " This may only be set on directories."] const MUTATE_DIRECTORY = 1 << 5;
+                }
             }
             wit_bindgen_rt::bitflags::bitflags! {
+                #[doc = " Flags determining the method of how paths are resolved."]
                 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)] pub
-                struct PathFlags : u8 { const SYMLINK_FOLLOW = 1 << 0; }
+                struct PathFlags : u8 { #[doc =
+                " As long as the resolved path corresponds to a symbolic link, it is"]
+                #[doc = " expanded."] const SYMLINK_FOLLOW = 1 << 0; }
             }
             wit_bindgen_rt::bitflags::bitflags! {
-                #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)] pub
-                struct OpenFlags : u8 { const CREATE = 1 << 0; const DIRECTORY = 1 << 1;
-                const EXCLUSIVE = 1 << 2; const TRUNCATE = 1 << 3; }
+                #[doc = " Open flags used by `open-at`."] #[derive(PartialEq, Eq,
+                PartialOrd, Ord, Hash, Debug, Clone, Copy)] pub struct OpenFlags : u8 {
+                #[doc =
+                " Create file if it does not exist, similar to `O_CREAT` in POSIX."]
+                const CREATE = 1 << 0; #[doc =
+                " Fail if not a directory, similar to `O_DIRECTORY` in POSIX."] const
+                DIRECTORY = 1 << 1; #[doc =
+                " Fail if file already exists, similar to `O_EXCL` in POSIX."] const
+                EXCLUSIVE = 1 << 2; #[doc =
+                " Truncate file to size 0, similar to `O_TRUNC` in POSIX."] const
+                TRUNCATE = 1 << 3; }
             }
+            /// Number of hard links to an inode.
             pub type LinkCount = u64;
+            /// File attributes.
+            ///
+            /// Note: This was called `filestat` in earlier versions of WASI.
             #[repr(C)]
             #[derive(Clone, Copy)]
             pub struct DescriptorStat {
+                /// File type.
                 pub type_: DescriptorType,
+                /// Number of hard links to the file.
                 pub link_count: LinkCount,
+                /// For regular files, the file size in bytes. For symbolic links, the
+                /// length in bytes of the pathname contained in the symbolic link.
                 pub size: Filesize,
+                /// Last data access timestamp.
+                ///
+                /// If the `option` is none, the platform doesn't maintain an access
+                /// timestamp for this file.
                 pub data_access_timestamp: Option<Datetime>,
+                /// Last data modification timestamp.
+                ///
+                /// If the `option` is none, the platform doesn't maintain a
+                /// modification timestamp for this file.
                 pub data_modification_timestamp: Option<Datetime>,
+                /// Last file status-change timestamp.
+                ///
+                /// If the `option` is none, the platform doesn't maintain a
+                /// status-change timestamp for this file.
                 pub status_change_timestamp: Option<Datetime>,
             }
             impl ::core::fmt::Debug for DescriptorStat {
@@ -565,10 +671,15 @@ pub mod wasi {
                         .finish()
                 }
             }
+            /// When setting a timestamp, this gives the value to set it to.
             #[derive(Clone, Copy)]
             pub enum NewTimestamp {
+                /// Leave the timestamp set to its previous value.
                 NoChange,
+                /// Set the timestamp to the current time of the system clock associated
+                /// with the filesystem.
                 Now,
+                /// Set the timestamp to the given value.
                 Timestamp(Datetime),
             }
             impl ::core::fmt::Debug for NewTimestamp {
@@ -587,9 +698,12 @@ pub mod wasi {
                     }
                 }
             }
+            /// A directory entry.
             #[derive(Clone)]
             pub struct DirectoryEntry {
+                /// The type of the file referred to by this directory entry.
                 pub type_: DescriptorType,
+                /// The name of the object.
                 pub name: _rt::String,
             }
             impl ::core::fmt::Debug for DirectoryEntry {
@@ -603,45 +717,86 @@ pub mod wasi {
                         .finish()
                 }
             }
+            /// Error codes returned by functions, similar to `errno` in POSIX.
+            /// Not all of these error codes are returned by the functions provided by this
+            /// API; some are used in higher-level library layers, and others are provided
+            /// merely for alignment with POSIX.
             #[repr(u8)]
             #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
             pub enum ErrorCode {
+                /// Permission denied, similar to `EACCES` in POSIX.
                 Access,
+                /// Resource unavailable, or operation would block, similar to `EAGAIN` and `EWOULDBLOCK` in POSIX.
                 WouldBlock,
+                /// Connection already in progress, similar to `EALREADY` in POSIX.
                 Already,
+                /// Bad descriptor, similar to `EBADF` in POSIX.
                 BadDescriptor,
+                /// Device or resource busy, similar to `EBUSY` in POSIX.
                 Busy,
+                /// Resource deadlock would occur, similar to `EDEADLK` in POSIX.
                 Deadlock,
+                /// Storage quota exceeded, similar to `EDQUOT` in POSIX.
                 Quota,
+                /// File exists, similar to `EEXIST` in POSIX.
                 Exist,
+                /// File too large, similar to `EFBIG` in POSIX.
                 FileTooLarge,
+                /// Illegal byte sequence, similar to `EILSEQ` in POSIX.
                 IllegalByteSequence,
+                /// Operation in progress, similar to `EINPROGRESS` in POSIX.
                 InProgress,
+                /// Interrupted function, similar to `EINTR` in POSIX.
                 Interrupted,
+                /// Invalid argument, similar to `EINVAL` in POSIX.
                 Invalid,
+                /// I/O error, similar to `EIO` in POSIX.
                 Io,
+                /// Is a directory, similar to `EISDIR` in POSIX.
                 IsDirectory,
+                /// Too many levels of symbolic links, similar to `ELOOP` in POSIX.
                 Loop,
+                /// Too many links, similar to `EMLINK` in POSIX.
                 TooManyLinks,
+                /// Message too large, similar to `EMSGSIZE` in POSIX.
                 MessageSize,
+                /// Filename too long, similar to `ENAMETOOLONG` in POSIX.
                 NameTooLong,
+                /// No such device, similar to `ENODEV` in POSIX.
                 NoDevice,
+                /// No such file or directory, similar to `ENOENT` in POSIX.
                 NoEntry,
+                /// No locks available, similar to `ENOLCK` in POSIX.
                 NoLock,
+                /// Not enough space, similar to `ENOMEM` in POSIX.
                 InsufficientMemory,
+                /// No space left on device, similar to `ENOSPC` in POSIX.
                 InsufficientSpace,
+                /// Not a directory or a symbolic link to a directory, similar to `ENOTDIR` in POSIX.
                 NotDirectory,
+                /// Directory not empty, similar to `ENOTEMPTY` in POSIX.
                 NotEmpty,
+                /// State not recoverable, similar to `ENOTRECOVERABLE` in POSIX.
                 NotRecoverable,
+                /// Not supported, similar to `ENOTSUP` and `ENOSYS` in POSIX.
                 Unsupported,
+                /// Inappropriate I/O control operation, similar to `ENOTTY` in POSIX.
                 NoTty,
+                /// No such device or address, similar to `ENXIO` in POSIX.
                 NoSuchDevice,
+                /// Value too large to be stored in data type, similar to `EOVERFLOW` in POSIX.
                 Overflow,
+                /// Operation not permitted, similar to `EPERM` in POSIX.
                 NotPermitted,
+                /// Broken pipe, similar to `EPIPE` in POSIX.
                 Pipe,
+                /// Read-only file system, similar to `EROFS` in POSIX.
                 ReadOnly,
+                /// Invalid seek, similar to `ESPIPE` in POSIX.
                 InvalidSeek,
+                /// Text file busy, similar to `ETXTBSY` in POSIX.
                 TextFileBusy,
+                /// Cross-device link, similar to `EXDEV` in POSIX.
                 CrossDevice,
             }
             impl ErrorCode {
@@ -688,43 +843,111 @@ pub mod wasi {
                 }
                 pub fn message(&self) -> &'static str {
                     match self {
-                        ErrorCode::Access => "",
-                        ErrorCode::WouldBlock => "",
-                        ErrorCode::Already => "",
-                        ErrorCode::BadDescriptor => "",
-                        ErrorCode::Busy => "",
-                        ErrorCode::Deadlock => "",
-                        ErrorCode::Quota => "",
-                        ErrorCode::Exist => "",
-                        ErrorCode::FileTooLarge => "",
-                        ErrorCode::IllegalByteSequence => "",
-                        ErrorCode::InProgress => "",
-                        ErrorCode::Interrupted => "",
-                        ErrorCode::Invalid => "",
-                        ErrorCode::Io => "",
-                        ErrorCode::IsDirectory => "",
-                        ErrorCode::Loop => "",
-                        ErrorCode::TooManyLinks => "",
-                        ErrorCode::MessageSize => "",
-                        ErrorCode::NameTooLong => "",
-                        ErrorCode::NoDevice => "",
-                        ErrorCode::NoEntry => "",
-                        ErrorCode::NoLock => "",
-                        ErrorCode::InsufficientMemory => "",
-                        ErrorCode::InsufficientSpace => "",
-                        ErrorCode::NotDirectory => "",
-                        ErrorCode::NotEmpty => "",
-                        ErrorCode::NotRecoverable => "",
-                        ErrorCode::Unsupported => "",
-                        ErrorCode::NoTty => "",
-                        ErrorCode::NoSuchDevice => "",
-                        ErrorCode::Overflow => "",
-                        ErrorCode::NotPermitted => "",
-                        ErrorCode::Pipe => "",
-                        ErrorCode::ReadOnly => "",
-                        ErrorCode::InvalidSeek => "",
-                        ErrorCode::TextFileBusy => "",
-                        ErrorCode::CrossDevice => "",
+                        ErrorCode::Access => {
+                            "Permission denied, similar to `EACCES` in POSIX."
+                        }
+                        ErrorCode::WouldBlock => {
+                            "Resource unavailable, or operation would block, similar to `EAGAIN` and `EWOULDBLOCK` in POSIX."
+                        }
+                        ErrorCode::Already => {
+                            "Connection already in progress, similar to `EALREADY` in POSIX."
+                        }
+                        ErrorCode::BadDescriptor => {
+                            "Bad descriptor, similar to `EBADF` in POSIX."
+                        }
+                        ErrorCode::Busy => {
+                            "Device or resource busy, similar to `EBUSY` in POSIX."
+                        }
+                        ErrorCode::Deadlock => {
+                            "Resource deadlock would occur, similar to `EDEADLK` in POSIX."
+                        }
+                        ErrorCode::Quota => {
+                            "Storage quota exceeded, similar to `EDQUOT` in POSIX."
+                        }
+                        ErrorCode::Exist => "File exists, similar to `EEXIST` in POSIX.",
+                        ErrorCode::FileTooLarge => {
+                            "File too large, similar to `EFBIG` in POSIX."
+                        }
+                        ErrorCode::IllegalByteSequence => {
+                            "Illegal byte sequence, similar to `EILSEQ` in POSIX."
+                        }
+                        ErrorCode::InProgress => {
+                            "Operation in progress, similar to `EINPROGRESS` in POSIX."
+                        }
+                        ErrorCode::Interrupted => {
+                            "Interrupted function, similar to `EINTR` in POSIX."
+                        }
+                        ErrorCode::Invalid => {
+                            "Invalid argument, similar to `EINVAL` in POSIX."
+                        }
+                        ErrorCode::Io => "I/O error, similar to `EIO` in POSIX.",
+                        ErrorCode::IsDirectory => {
+                            "Is a directory, similar to `EISDIR` in POSIX."
+                        }
+                        ErrorCode::Loop => {
+                            "Too many levels of symbolic links, similar to `ELOOP` in POSIX."
+                        }
+                        ErrorCode::TooManyLinks => {
+                            "Too many links, similar to `EMLINK` in POSIX."
+                        }
+                        ErrorCode::MessageSize => {
+                            "Message too large, similar to `EMSGSIZE` in POSIX."
+                        }
+                        ErrorCode::NameTooLong => {
+                            "Filename too long, similar to `ENAMETOOLONG` in POSIX."
+                        }
+                        ErrorCode::NoDevice => {
+                            "No such device, similar to `ENODEV` in POSIX."
+                        }
+                        ErrorCode::NoEntry => {
+                            "No such file or directory, similar to `ENOENT` in POSIX."
+                        }
+                        ErrorCode::NoLock => {
+                            "No locks available, similar to `ENOLCK` in POSIX."
+                        }
+                        ErrorCode::InsufficientMemory => {
+                            "Not enough space, similar to `ENOMEM` in POSIX."
+                        }
+                        ErrorCode::InsufficientSpace => {
+                            "No space left on device, similar to `ENOSPC` in POSIX."
+                        }
+                        ErrorCode::NotDirectory => {
+                            "Not a directory or a symbolic link to a directory, similar to `ENOTDIR` in POSIX."
+                        }
+                        ErrorCode::NotEmpty => {
+                            "Directory not empty, similar to `ENOTEMPTY` in POSIX."
+                        }
+                        ErrorCode::NotRecoverable => {
+                            "State not recoverable, similar to `ENOTRECOVERABLE` in POSIX."
+                        }
+                        ErrorCode::Unsupported => {
+                            "Not supported, similar to `ENOTSUP` and `ENOSYS` in POSIX."
+                        }
+                        ErrorCode::NoTty => {
+                            "Inappropriate I/O control operation, similar to `ENOTTY` in POSIX."
+                        }
+                        ErrorCode::NoSuchDevice => {
+                            "No such device or address, similar to `ENXIO` in POSIX."
+                        }
+                        ErrorCode::Overflow => {
+                            "Value too large to be stored in data type, similar to `EOVERFLOW` in POSIX."
+                        }
+                        ErrorCode::NotPermitted => {
+                            "Operation not permitted, similar to `EPERM` in POSIX."
+                        }
+                        ErrorCode::Pipe => "Broken pipe, similar to `EPIPE` in POSIX.",
+                        ErrorCode::ReadOnly => {
+                            "Read-only file system, similar to `EROFS` in POSIX."
+                        }
+                        ErrorCode::InvalidSeek => {
+                            "Invalid seek, similar to `ESPIPE` in POSIX."
+                        }
+                        ErrorCode::TextFileBusy => {
+                            "Text file busy, similar to `ETXTBSY` in POSIX."
+                        }
+                        ErrorCode::CrossDevice => {
+                            "Cross-device link, similar to `EXDEV` in POSIX."
+                        }
                     }
                 }
             }
@@ -797,14 +1020,27 @@ pub mod wasi {
                     }
                 }
             }
+            /// File or memory access pattern advisory information.
             #[repr(u8)]
             #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
             pub enum Advice {
+                /// The application has no advice to give on its behavior with respect
+                /// to the specified data.
                 Normal,
+                /// The application expects to access the specified data sequentially
+                /// from lower offsets to higher offsets.
                 Sequential,
+                /// The application expects to access the specified data in a random
+                /// order.
                 Random,
+                /// The application expects to access the specified data in the near
+                /// future.
                 WillNeed,
+                /// The application expects that it will not access the specified data
+                /// in the near future.
                 DontNeed,
+                /// The application expects to access the specified data once and then
+                /// not reuse it thereafter.
                 NoReuse,
             }
             impl ::core::fmt::Debug for Advice {
@@ -841,10 +1077,14 @@ pub mod wasi {
                     }
                 }
             }
+            /// A 128-bit hash value, split into parts because wasm doesn't have a
+            /// 128-bit integer type.
             #[repr(C)]
             #[derive(Clone, Copy)]
             pub struct MetadataHashValue {
+                /// 64 bits of a 128-bit hash value.
                 pub lower: u64,
+                /// Another 64 bits of a 128-bit hash value.
                 pub upper: u64,
             }
             impl ::core::fmt::Debug for MetadataHashValue {
@@ -858,6 +1098,9 @@ pub mod wasi {
                         .finish()
                 }
             }
+            /// A descriptor is a reference to a filesystem object, which may be a file,
+            /// directory, named pipe, special file, or other object on which filesystem
+            /// calls may be made.
             #[derive(Debug)]
             #[repr(transparent)]
             pub struct Descriptor {
@@ -895,6 +1138,7 @@ pub mod wasi {
                     }
                 }
             }
+            /// A stream of directory entries.
             #[derive(Debug)]
             #[repr(transparent)]
             pub struct DirectoryEntryStream {
@@ -934,6 +1178,14 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Return a stream for reading from a file, if available.
+                ///
+                /// May fail with an error-code describing why the file cannot be read.
+                ///
+                /// Multiple read, write, and append streams may be active on the same open
+                /// file and they do not interfere with each other.
+                ///
+                /// Note: This allows using `read-stream`, which is similar to `read` in POSIX.
                 pub fn read_via_stream(
                     &self,
                     offset: Filesize,
@@ -990,6 +1242,12 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Return a stream for writing to a file, if available.
+                ///
+                /// May fail with an error-code describing why the file cannot be written.
+                ///
+                /// Note: This allows using `write-stream`, which is similar to `write` in
+                /// POSIX.
                 pub fn write_via_stream(
                     &self,
                     offset: Filesize,
@@ -1046,6 +1304,12 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Return a stream for appending to a file, if available.
+                ///
+                /// May fail with an error-code describing why the file cannot be appended.
+                ///
+                /// Note: This allows using `write-stream`, which is similar to `write` with
+                /// `O_APPEND` in POSIX.
                 pub fn append_via_stream(&self) -> Result<OutputStream, ErrorCode> {
                     unsafe {
                         #[repr(align(4))]
@@ -1093,6 +1357,9 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Provide file advisory information on a descriptor.
+                ///
+                /// This is similar to `posix_fadvise` in POSIX.
                 pub fn advise(
                     &self,
                     offset: Filesize,
@@ -1152,6 +1419,12 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Synchronize the data of a file to disk.
+                ///
+                /// This function succeeds with no effect if the file descriptor is not
+                /// opened for writing.
+                ///
+                /// Note: This is similar to `fdatasync` in POSIX.
                 pub fn sync_data(&self) -> Result<(), ErrorCode> {
                     unsafe {
                         #[repr(align(1))]
@@ -1192,6 +1465,12 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Get flags associated with a descriptor.
+                ///
+                /// Note: This returns similar flags to `fcntl(fd, F_GETFL)` in POSIX.
+                ///
+                /// Note: This returns the value that was the `fs_flags` value returned
+                /// from `fdstat_get` in earlier versions of WASI.
                 pub fn get_flags(&self) -> Result<DescriptorFlags, ErrorCode> {
                     unsafe {
                         #[repr(align(1))]
@@ -1236,6 +1515,16 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Get the dynamic type of a descriptor.
+                ///
+                /// Note: This returns the same value as the `type` field of the `fd-stat`
+                /// returned by `stat`, `stat-at` and similar.
+                ///
+                /// Note: This returns similar flags to the `st_mode & S_IFMT` value provided
+                /// by `fstat` in POSIX.
+                ///
+                /// Note: This returns the value that was the `fs_filetype` value returned
+                /// from `fdstat_get` in earlier versions of WASI.
                 pub fn get_type(&self) -> Result<DescriptorType, ErrorCode> {
                     unsafe {
                         #[repr(align(1))]
@@ -1279,6 +1568,10 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Adjust the size of an open file. If this increases the file's size, the
+                /// extra bytes are filled with zeros.
+                ///
+                /// Note: This was called `fd_filestat_set_size` in earlier versions of WASI.
                 pub fn set_size(&self, size: Filesize) -> Result<(), ErrorCode> {
                     unsafe {
                         #[repr(align(1))]
@@ -1321,6 +1614,11 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Adjust the timestamps of an open file or directory.
+                ///
+                /// Note: This is similar to `futimens` in POSIX.
+                ///
+                /// Note: This was called `fd_filestat_set_times` in earlier versions of WASI.
                 pub fn set_times(
                     &self,
                     data_access_timestamp: NewTimestamp,
@@ -1416,6 +1714,17 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Read from a descriptor, without using and updating the descriptor's offset.
+                ///
+                /// This function returns a list of bytes containing the data that was
+                /// read, along with a bool which, when true, indicates that the end of the
+                /// file was reached. The returned list will contain up to `length` bytes; it
+                /// may return fewer than requested, if the end of the file is reached or
+                /// if the I/O operation is interrupted.
+                ///
+                /// In the future, this may change to return a `stream<u8, error-code>`.
+                ///
+                /// Note: This is similar to `pread` in POSIX.
                 pub fn read(
                     &self,
                     length: Filesize,
@@ -1497,6 +1806,15 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Write to a descriptor, without using and updating the descriptor's offset.
+                ///
+                /// It is valid to write past the end of a file; the file is extended to the
+                /// extent of the write, with bytes between the previous end and the start of
+                /// the write set to zero.
+                ///
+                /// In the future, this may change to take a `stream<u8, error-code>`.
+                ///
+                /// Note: This is similar to `pwrite` in POSIX.
                 pub fn write(
                     &self,
                     buffer: &[u8],
@@ -1567,6 +1885,15 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Read directory entries from a directory.
+                ///
+                /// On filesystems where directories contain entries referring to themselves
+                /// and their parents, often named `.` and `..` respectively, these entries
+                /// are omitted.
+                ///
+                /// This always returns a new stream which starts at the beginning of the
+                /// directory. Multiple streams may be active on the same directory, and they
+                /// do not interfere with each other.
                 pub fn read_directory(&self) -> Result<DirectoryEntryStream, ErrorCode> {
                     unsafe {
                         #[repr(align(4))]
@@ -1610,6 +1937,12 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Synchronize the data and metadata of a file to disk.
+                ///
+                /// This function succeeds with no effect if the file descriptor is not
+                /// opened for writing.
+                ///
+                /// Note: This is similar to `fsync` in POSIX.
                 pub fn sync(&self) -> Result<(), ErrorCode> {
                     unsafe {
                         #[repr(align(1))]
@@ -1650,6 +1983,9 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Create a directory.
+                ///
+                /// Note: This is similar to `mkdirat` in POSIX.
                 pub fn create_directory_at(&self, path: &str) -> Result<(), ErrorCode> {
                     unsafe {
                         #[repr(align(1))]
@@ -1705,6 +2041,15 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Return the attributes of an open file or directory.
+                ///
+                /// Note: This is similar to `fstat` in POSIX, except that it does not return
+                /// device and inode information. For testing whether two descriptors refer to
+                /// the same underlying filesystem object, use `is-same-object`. To obtain
+                /// additional data that can be used do determine whether a file has been
+                /// modified, use `metadata-hash`.
+                ///
+                /// Note: This was called `fd_filestat_get` in earlier versions of WASI.
                 pub fn stat(&self) -> Result<DescriptorStat, ErrorCode> {
                     unsafe {
                         #[repr(align(8))]
@@ -1802,6 +2147,13 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Return the attributes of a file or directory.
+                ///
+                /// Note: This is similar to `fstatat` in POSIX, except that it does not
+                /// return device and inode information. See the `stat` description for a
+                /// discussion of alternatives.
+                ///
+                /// Note: This was called `path_filestat_get` in earlier versions of WASI.
                 pub fn stat_at(
                     &self,
                     path_flags: PathFlags,
@@ -1927,6 +2279,12 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Adjust the timestamps of a file or directory.
+                ///
+                /// Note: This is similar to `utimensat` in POSIX.
+                ///
+                /// Note: This was called `path_filestat_set_times` in earlier versions of
+                /// WASI.
                 pub fn set_times_at(
                     &self,
                     path_flags: PathFlags,
@@ -2037,6 +2395,13 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Create a hard link.
+                ///
+                /// Fails with `error-code::no-entry` if the old path does not exist,
+                /// with `error-code::exist` if the new path already exists, and
+                /// `error-code::not-permitted` if the old path is not a file.
+                ///
+                /// Note: This is similar to `linkat` in POSIX.
                 pub fn link_at(
                     &self,
                     old_path_flags: PathFlags,
@@ -2119,6 +2484,18 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Open a file or directory.
+                ///
+                /// If `flags` contains `descriptor-flags::mutate-directory`, and the base
+                /// descriptor doesn't have `descriptor-flags::mutate-directory` set,
+                /// `open-at` fails with `error-code::read-only`.
+                ///
+                /// If `flags` contains `write` or `mutate-directory`, or `open-flags`
+                /// contains `truncate` or `create`, and the base descriptor doesn't have
+                /// `descriptor-flags::mutate-directory` set, `open-at` fails with
+                /// `error-code::read-only`.
+                ///
+                /// Note: This is similar to `openat` in POSIX.
                 pub fn open_at(
                     &self,
                     path_flags: PathFlags,
@@ -2200,6 +2577,12 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Read the contents of a symbolic link.
+                ///
+                /// If the contents contain an absolute or rooted path in the underlying
+                /// filesystem, this function fails with `error-code::not-permitted`.
+                ///
+                /// Note: This is similar to `readlinkat` in POSIX.
                 pub fn readlink_at(&self, path: &str) -> Result<_rt::String, ErrorCode> {
                     unsafe {
                         #[cfg_attr(target_pointer_width = "64", repr(align(8)))]
@@ -2277,6 +2660,11 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Remove a directory.
+                ///
+                /// Return `error-code::not-empty` if the directory is not empty.
+                ///
+                /// Note: This is similar to `unlinkat(fd, path, AT_REMOVEDIR)` in POSIX.
                 pub fn remove_directory_at(&self, path: &str) -> Result<(), ErrorCode> {
                     unsafe {
                         #[repr(align(1))]
@@ -2332,6 +2720,9 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Rename a filesystem object.
+                ///
+                /// Note: This is similar to `renameat` in POSIX.
                 pub fn rename_at(
                     &self,
                     old_path: &str,
@@ -2409,6 +2800,12 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Create a symbolic link (also known as a "symlink").
+                ///
+                /// If `old-path` starts with `/`, the function fails with
+                /// `error-code::not-permitted`.
+                ///
+                /// Note: This is similar to `symlinkat` in POSIX.
                 pub fn symlink_at(
                     &self,
                     old_path: &str,
@@ -2482,6 +2879,10 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Unlink a filesystem object that is not a directory.
+                ///
+                /// Return `error-code::is-directory` if the path refers to a directory.
+                /// Note: This is similar to `unlinkat(fd, path, 0)` in POSIX.
                 pub fn unlink_file_at(&self, path: &str) -> Result<(), ErrorCode> {
                     unsafe {
                         #[repr(align(1))]
@@ -2537,6 +2938,12 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Test whether two descriptors refer to the same filesystem object.
+                ///
+                /// In POSIX, this corresponds to testing whether the two descriptors have the
+                /// same device (`st_dev`) and inode (`st_ino` or `d_ino`) numbers.
+                /// wasi-filesystem does not expose device and inode numbers, so this function
+                /// may be used instead.
                 pub fn is_same_object(&self, other: &Descriptor) -> bool {
                     unsafe {
                         #[cfg(target_arch = "wasm32")]
@@ -2558,6 +2965,25 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Return a hash of the metadata associated with a filesystem object referred
+                /// to by a descriptor.
+                ///
+                /// This returns a hash of the last-modification timestamp and file size, and
+                /// may also include the inode number, device number, birth timestamp, and
+                /// other metadata fields that may change when the file is modified or
+                /// replaced. It may also include a secret value chosen by the
+                /// implementation and not otherwise exposed.
+                ///
+                /// Implementations are encouraged to provide the following properties:
+                ///
+                ///  - If the file is not modified or replaced, the computed hash value should
+                ///    usually not change.
+                ///  - If the object is modified or replaced, the computed hash value should
+                ///    usually change.
+                ///  - The inputs to the hash should not be easily computable from the
+                ///    computed hash.
+                ///
+                /// However, none of these is required.
                 pub fn metadata_hash(&self) -> Result<MetadataHashValue, ErrorCode> {
                     unsafe {
                         #[repr(align(8))]
@@ -2605,6 +3031,10 @@ pub mod wasi {
             }
             impl Descriptor {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Return a hash of the metadata associated with a filesystem object referred
+                /// to by a directory descriptor and a relative path.
+                ///
+                /// This performs the same hash computation as `metadata-hash`.
                 pub fn metadata_hash_at(
                     &self,
                     path_flags: PathFlags,
@@ -2680,6 +3110,7 @@ pub mod wasi {
             }
             impl DirectoryEntryStream {
                 #[allow(unused_unsafe, clippy::all)]
+                /// Read a single directory entry from a `directory-entry-stream`.
                 pub fn read_directory_entry(
                     &self,
                 ) -> Result<Option<DirectoryEntry>, ErrorCode> {
@@ -2763,6 +3194,16 @@ pub mod wasi {
                 }
             }
             #[allow(unused_unsafe, clippy::all)]
+            /// Attempts to extract a filesystem-related `error-code` from the stream
+            /// `error` provided.
+            ///
+            /// Stream operations which return `stream-error::last-operation-failed`
+            /// have a payload with more information about the operation that failed.
+            /// This payload can be passed through to this function to see if there's
+            /// filesystem-related information about the error to return.
+            ///
+            /// Note that this function is fallible because not all stream-related
+            /// errors are filesystem-related errors.
             pub fn filesystem_error_code(err: &Error) -> Option<ErrorCode> {
                 unsafe {
                     #[repr(align(1))]
@@ -2804,6 +3245,7 @@ pub mod wasi {
             use super::super::super::_rt;
             pub type Descriptor = super::super::super::wasi::filesystem::types::Descriptor;
             #[allow(unused_unsafe, clippy::all)]
+            /// Return the set of preopened directories, and their paths.
             pub fn get_directories() -> _rt::Vec<(Descriptor, _rt::String)> {
                 unsafe {
                     #[cfg_attr(target_pointer_width = "64", repr(align(8)))]
