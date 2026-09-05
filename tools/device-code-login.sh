@@ -26,11 +26,31 @@ mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 TOKEN_FILE="$STATE_DIR/token.json"
 
+# Encode application/x-www-form-urlencoded on stdout. Values are read from
+# KEY=VALUE lines on stdin so secrets never appear on curl's argv (`ps`).
+form_body() {
+  python3 -c '
+import sys, urllib.parse
+pairs = []
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    key, _, value = line.partition("=")
+    pairs.append((key, value))
+sys.stdout.write(urllib.parse.urlencode(pairs))
+'
+}
+
 echo "Requesting device code from Azure AD (tenant: $TENANT_ID)..." >&2
-device_resp=$(curl -sS -X POST \
+device_resp=$(form_body <<EOF | curl -sS -X POST \
   "https://login.microsoftonline.com/$TENANT_ID/oauth2/v2.0/devicecode" \
-  -d "client_id=$CLIENT_ID" \
-  --data-urlencode "scope=$SCOPES")
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-binary @-
+client_id=${CLIENT_ID}
+scope=${SCOPES}
+EOF
+)
 
 user_code=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["user_code"])' <<<"$device_resp")
 verification_uri=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["verification_uri"])' <<<"$device_resp")
@@ -53,11 +73,15 @@ while :; do
     exit 1
   fi
   sleep "$interval"
-  token_resp=$(curl -sS -X POST \
+  token_resp=$(form_body <<EOF | curl -sS -X POST \
     "https://login.microsoftonline.com/$TENANT_ID/oauth2/v2.0/token" \
-    -d "client_id=$CLIENT_ID" \
-    -d "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
-    -d "device_code=$device_code")
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-binary @-
+client_id=${CLIENT_ID}
+grant_type=urn:ietf:params:oauth:grant-type:device_code
+device_code=${device_code}
+EOF
+)
 
   error=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("error",""))' <<<"$token_resp")
   case "$error" in

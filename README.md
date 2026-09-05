@@ -185,17 +185,20 @@ curl -u "daemon:$SECRET" -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8765/
   `~/.config/onedrive-davfs/env` (mode 600) via `EnvironmentFile=`; the
   same secret goes in `~/.davfs2/secrets` (mode 600).
   `tools/device-code-login.sh` runs under `umask 077`, creates the state
-  directory `0700` and `token.json` `0600` atomically, and passes the token
-  response to `python3` over stdin (never argv).
+  directory `0700` and `token.json` `0600` atomically, posts OAuth form
+  bodies to `curl` on stdin (`--data-binary @-`, never `-d` on argv), and
+  passes the token response to `python3` over stdin.
 - **Paths are sanitised.** Request paths and `MOVE` `Destination` values
   are percent-decoded, `.`/`..` segments and control characters are
   rejected with `400`, and every segment is re-encoded before it is
   interpolated into a Graph `root:/…:` address. Query strings are dropped.
+  Absolute `Destination` URLs are accepted only when the host is loopback.
 - **Outbound requests only go to Microsoft.** The HTTP client is
   `https://`-only; the bearer token is attached only to
   `graph.microsoft.com` requests (pagination `@odata.nextLink` values are
   checked against that origin and capped at 500 pages); the pre-authenticated
-  `/content` download redirect is followed *without* the bearer.
+  `/content` download redirect is followed *without* the bearer and only
+  when the `Location` host is a known Microsoft download domain.
 - **No token logging.** The component emits no log lines; Graph error
   bodies are relayed to the client as `502` text but never include the
   `Authorization` header or token endpoint payloads.

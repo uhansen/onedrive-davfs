@@ -167,17 +167,45 @@ fn header_value(headers: &Fields, name: &str) -> Option<String> {
 }
 
 /// Extracts the path portion out of a raw `Destination` header value,
-/// which may be an absolute URL (`https://host/OneDrive/foo`) or already a
-/// bare path (`/OneDrive/foo`) depending on the WebDAV client.
-fn destination_path(raw: &str) -> String {
-    if let Some(idx) = raw.find("://") {
-        raw[idx + 3..]
-            .find('/')
-            .map(|i| raw[idx + 3 + i..].to_string())
-            .unwrap_or_default()
-    } else {
-        raw.to_string()
+/// which may be an absolute URL (`http://127.0.0.1:8765/foo`) or already a
+/// bare path (`/foo`) depending on the WebDAV client. Absolute URLs are
+/// only accepted when the host is loopback — a foreign host is refused
+/// rather than stripped (confused-deputy MOVE).
+fn destination_path(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if !raw.contains("://") {
+        return Ok(raw.to_string());
     }
+    let rest = raw
+        .split_once("://")
+        .map(|(_, r)| r)
+        .ok_or_else(|| "malformed Destination URL".to_string())?;
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    if !is_loopback_hostport(hostport) {
+        return Err("Destination host must be loopback".to_string());
+    }
+    Ok(path.to_string())
+}
+
+fn is_loopback_hostport(hostport: &str) -> bool {
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if let Some((h, port)) = hostport.rsplit_once(':') {
+        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            h
+        } else {
+            hostport
+        }
+    } else {
+        hostport
+    };
+    matches!(
+        host,
+        "127.0.0.1" | "localhost" | "localhost.localdomain" | "::1"
+    )
 }
 
 fn respond(
@@ -273,7 +301,7 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
     };
     let depth = header_value(&headers, "depth");
     let destination = match header_value(&headers, "destination") {
-        Some(d) => match sanitize_path(&destination_path(&d)) {
+        Some(d) => match destination_path(&d).and_then(|p| sanitize_path(&p)) {
             Ok(p) => Some(p),
             Err(e) => return DavResponse::error(400, format!("bad Destination: {e}")),
         },
@@ -367,9 +395,16 @@ mod tests {
     }
 
     #[test]
-    fn destination_path_strips_scheme_and_host() {
-        assert_eq!(destination_path("http://127.0.0.1:8765/x/y"), "/x/y");
-        assert_eq!(destination_path("/x/y"), "/x/y");
-        assert_eq!(destination_path("http://host"), "");
+    fn destination_path_strips_loopback_and_rejects_foreign_hosts() {
+        assert_eq!(
+            destination_path("http://127.0.0.1:8765/x/y").unwrap(),
+            "/x/y"
+        );
+        assert_eq!(destination_path("http://localhost/x/y").unwrap(), "/x/y");
+        assert_eq!(destination_path("http://[::1]:8765/x").unwrap(), "/x");
+        assert_eq!(destination_path("/x/y").unwrap(), "/x/y");
+        assert!(destination_path("http://evil.example/x").is_err());
+        assert!(destination_path("https://graph.microsoft.com/x").is_err());
+        assert_eq!(destination_path("http://127.0.0.1").unwrap(), "/");
     }
 }

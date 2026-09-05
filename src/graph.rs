@@ -83,6 +83,26 @@ fn drive_root_segment(drive_base: &str) -> String {
     }
 }
 
+/// Graph `parentReference.path` uses `/<drive>/root:` for the drive root
+/// and `/<drive>/root:/folder` (no trailing colon) for a folder — not the
+/// item-address form (`.../root:/folder:`) used in request URLs.
+fn parent_reference_path(drive_base: &str, parent: &str) -> String {
+    let drive_root = drive_root_segment(drive_base);
+    let trimmed = parent.trim_matches('/');
+    if trimmed.is_empty() {
+        format!("{drive_root}/root:")
+    } else {
+        format!(
+            "{drive_root}/root:/{}",
+            trimmed
+                .split('/')
+                .map(crate::xml::pct_encode)
+                .collect::<Vec<_>>()
+                .join("/")
+        )
+    }
+}
+
 fn item_path_segment(drive_base: &str, path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
     let drive_root = drive_root_segment(drive_base);
@@ -209,6 +229,42 @@ fn validate_next_link(next: &str, pages_so_far: usize) -> Result<String, String>
 
 const GRAPH_ORIGIN: &str = "https://graph.microsoft.com/";
 
+/// Hosts Graph uses for pre-authenticated `/content` download redirects.
+/// Matched exactly or as a DNS suffix (so `foo.sharepoint.com` is allowed
+/// but `sharepoint.com.evil.example` is not). Bearer is never attached.
+fn is_allowed_download_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let hostport = rest.split('/').next().unwrap_or("");
+    let host = if let Some(inner) = hostport.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        hostport
+            .rsplit_once(':')
+            .filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+            .map(|(h, _)| h)
+            .unwrap_or(hostport)
+    };
+    let host = host.to_ascii_lowercase();
+    const ALLOWED: &[&str] = &[
+        "graph.microsoft.com",
+        "sharepoint.com",
+        "sharepointonline.com",
+        "onedrive.com",
+        "live.com",
+        "live.net",
+        "1drv.com",
+        "1drv.ms",
+        "office.com",
+        "office365.com",
+        "blob.core.windows.net",
+    ];
+    ALLOWED
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+}
+
 pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}/content",
@@ -221,7 +277,7 @@ pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
             let location = response
                 .header_value("location")
                 .ok_or_else(|| "graph get_content redirect missing Location header".to_string())?;
-            if !location.starts_with("https://") {
+            if !is_allowed_download_url(&location) {
                 return Err(format!(
                     "graph get_content redirect to unsupported URL: {location}"
                 ));
@@ -338,7 +394,9 @@ pub fn move_or_rename(config: &Config, from_path: &str, to_path: &str) -> Result
     };
     let body = serde_json::json!({
         "name": new_name,
-        "parentReference": { "path": format!("/drive/root:{new_parent}") },
+        "parentReference": {
+            "path": parent_reference_path(&config.drive_base, new_parent)
+        },
     });
     let response = graph_request(
         config,
@@ -415,6 +473,38 @@ mod tests {
         assert!(validate_next_link("https://graph.microsoft.com.evil/x", 1).is_err());
         assert!(
             validate_next_link("https://graph.microsoft.com/v1.0/x", MAX_CHILDREN_PAGES).is_err()
+        );
+    }
+
+    #[test]
+    fn download_redirect_hosts_are_pinned() {
+        assert!(is_allowed_download_url(
+            "https://mytenant.sharepoint.com/sites/x/_layouts/download.aspx?x=1"
+        ));
+        assert!(is_allowed_download_url(
+            "https://graph.microsoft.com/v1.0/me/drive/items/id/content"
+        ));
+        assert!(is_allowed_download_url(
+            "https://bn.files.1drv.com/y4mABC/file.bin"
+        ));
+        assert!(!is_allowed_download_url("http://sharepoint.com/x"));
+        assert!(!is_allowed_download_url("https://evil.example/x"));
+        assert!(!is_allowed_download_url(
+            "https://sharepoint.com.evil.example/x"
+        ));
+        assert!(!is_allowed_download_url("https://notsharepoint.com/x"));
+    }
+
+    #[test]
+    fn move_parent_reference_uses_drive_selector() {
+        assert_eq!(
+            parent_reference_path("me/drive", "/Documents"),
+            "/me/drive/root:/Documents"
+        );
+        assert_eq!(parent_reference_path("me/drive", "/"), "/me/drive/root:");
+        assert_eq!(
+            parent_reference_path("B087983F641B9ED3", "/Documents"),
+            "/drives/B087983F641B9ED3/root:/Documents"
         );
     }
 }

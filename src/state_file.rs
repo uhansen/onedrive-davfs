@@ -29,6 +29,9 @@ pub fn read_file(dir: &Descriptor, name: &str) -> Result<Option<Vec<u8>>, String
     Ok(Some(contents))
 }
 
+/// Overwrites `name` in place. WASI Preview 2 has no chmod, so a newly
+/// created file follows the host umask; `tools/device-code-login.sh`
+/// creates `token.json` as `0600` first so a later refresh keeps that mode.
 pub fn write_file(dir: &Descriptor, name: &str, contents: &[u8]) -> Result<(), String> {
     let file = dir
         .open_at(
