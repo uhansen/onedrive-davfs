@@ -203,14 +203,16 @@ curl -u "daemon:$SECRET" -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8765/
   `https://`-only; the bearer token is attached only to
   `graph.microsoft.com` requests (pagination `@odata.nextLink` values are
   checked against that origin and capped at 500 pages); the pre-authenticated
-  `/content` download redirect is followed *without* the bearer and only
-  when the `Location` host is a known Microsoft download domain.
+  `/content` download redirect is followed *without* the bearer, exactly
+  one hop, and only when `Location` is `https://`. Upload-session URLs
+  are treated the same way.
 - **No token logging.** The component emits no log lines; Graph error
   bodies are relayed to the client as `502` text but never include the
   `Authorization` header or token endpoint payloads.
 - Request bodies are only read for `PUT` (`PROPFIND`/`LOCK` bodies are
-  ignored, so there is no XML parsing surface). `PUT` is capped at Graph's
-  simple-upload ceiling.
+  ignored, so there is no XML parsing surface). `PUT` is buffered up to
+  64 MiB; files above Graph's 4 MiB simple-upload ceiling use a
+  `createUploadSession` with chunked `Content-Range` PUTs.
 
 ## Repo layout
 

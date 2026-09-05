@@ -9,55 +9,61 @@ use crate::xml::{self, DavEntry};
 
 pub struct DavResponse {
     pub status: u16,
-    pub content_type: &'static str,
+    pub content_type: String,
     pub body: Vec<u8>,
     pub headers: Vec<(&'static str, String)>,
+    /// When set, sent as `Content-Length` instead of `body.len()` (HEAD).
+    pub content_length: Option<u64>,
 }
 
 impl DavResponse {
     fn xml(status: u16, body: String) -> Self {
         DavResponse {
             status,
-            content_type: "application/xml; charset=utf-8",
+            content_type: "application/xml; charset=utf-8".to_string(),
             body: body.into_bytes(),
             headers: Vec::new(),
+            content_length: None,
         }
     }
 
     fn empty(status: u16) -> Self {
         DavResponse {
             status,
-            content_type: "text/plain",
+            content_type: "text/plain".to_string(),
             body: Vec::new(),
             headers: Vec::new(),
+            content_length: None,
         }
     }
 
     pub fn error(status: u16, message: impl Into<String>) -> Self {
         DavResponse {
             status,
-            content_type: "text/plain",
+            content_type: "text/plain".to_string(),
             body: message.into().into_bytes(),
             headers: Vec::new(),
+            content_length: None,
         }
     }
 
     pub fn unauthorized() -> Self {
         DavResponse {
             status: 401,
-            content_type: "text/plain",
+            content_type: "text/plain".to_string(),
             body: b"unauthorized".to_vec(),
             headers: vec![(
                 "www-authenticate",
                 r#"Basic realm="onedrive-davfs""#.to_string(),
             )],
+            content_length: None,
         }
     }
 
     pub fn options() -> Self {
         DavResponse {
             status: 200,
-            content_type: "text/plain",
+            content_type: "text/plain".to_string(),
             body: Vec::new(),
             headers: vec![
                 (
@@ -67,6 +73,7 @@ impl DavResponse {
                 ("dav", "1, 2".to_string()),
                 ("ms-author-via", "DAV".to_string()),
             ],
+            content_length: None,
         }
     }
 }
@@ -136,9 +143,10 @@ pub fn get(config: &Config, path: &str) -> DavResponse {
     match graph::get_content(config, path) {
         Ok(bytes) => DavResponse {
             status: 200,
-            content_type: "application/octet-stream",
+            content_type: "application/octet-stream".to_string(),
             body: bytes,
             headers: Vec::new(),
+            content_length: None,
         },
         Err(e) => DavResponse::error(502, e),
     }
@@ -146,20 +154,35 @@ pub fn get(config: &Config, path: &str) -> DavResponse {
 
 pub fn head(config: &Config, path: &str) -> DavResponse {
     match graph::stat(config, path) {
-        Ok(_) => DavResponse::empty(200),
+        Ok(item) => {
+            let content_type = if item.is_dir {
+                "httpd/unix-directory".to_string()
+            } else if item.mime_type.is_empty() {
+                "application/octet-stream".to_string()
+            } else {
+                item.mime_type
+            };
+            DavResponse {
+                status: 200,
+                content_type,
+                body: Vec::new(),
+                headers: Vec::new(),
+                content_length: Some(if item.is_dir { 0 } else { item.size }),
+            }
+        }
         Err(e) if e == "not found" => DavResponse::empty(404),
         Err(e) => DavResponse::error(502, e),
     }
 }
 
 pub fn put(config: &Config, path: &str, body: &[u8]) -> DavResponse {
-    if body.len() as u64 > graph::MAX_SIMPLE_UPLOAD_BYTES {
+    if body.len() as u64 > graph::MAX_UPLOAD_BYTES {
         return DavResponse::error(
-            507,
+            413,
             format!(
-                "file is {} bytes; this build only supports simple uploads up to {} bytes",
+                "file is {} bytes; this build only supports uploads up to {} bytes",
                 body.len(),
-                graph::MAX_SIMPLE_UPLOAD_BYTES
+                graph::MAX_UPLOAD_BYTES
             ),
         );
     }
@@ -220,7 +243,12 @@ pub fn lock(_config: &Config, path: &str) -> DavResponse {
         token = xml::pct_encode(path),
         href = xml::pct_encode(path),
     );
-    DavResponse::xml(200, body)
+    let mut response = DavResponse::xml(200, body);
+    response.headers.push((
+        "lock-token",
+        format!("<opaquelocktoken:{token}>", token = xml::pct_encode(path)),
+    ));
+    response
 }
 
 pub fn unlock(_config: &Config, _path: &str) -> DavResponse {

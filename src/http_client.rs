@@ -76,24 +76,38 @@ pub fn send(req: HttpRequest) -> Result<HttpResponse, String> {
         .set_path_with_query(Some(&path_with_query))
         .map_err(|_| "failed to set path".to_string())?;
 
-    if !req.body.is_empty() {
-        let body = request
-            .body()
-            .map_err(|_| "request body already taken".to_string())?;
+    // Take the body resource before handle() so the host can start the
+    // request; finishing a multi-MiB body first fills the outgoing buffer
+    // and traps with BodyWriteAborted.
+    let outgoing_body = if req.body.is_empty() {
+        None
+    } else {
+        Some(
+            request
+                .body()
+                .map_err(|_| "request body already taken".to_string())?,
+        )
+    };
+
+    let future_response = outgoing_handler::handle(request, None)
+        .map_err(|e| format!("failed to send request: {e:?}"))?;
+
+    if let Some(body) = outgoing_body {
         {
             let stream = body
                 .write()
                 .map_err(|_| "failed to open request body stream".to_string())?;
-            stream
-                .blocking_write_and_flush(req.body)
-                .map_err(|e| format!("failed writing request body: {e:?}"))?;
+            // wasi:io `blocking-write-and-flush` traps if contents > 4096 bytes.
+            const WRITE_CHUNK: usize = 4096;
+            for chunk in req.body.chunks(WRITE_CHUNK) {
+                stream
+                    .blocking_write_and_flush(chunk)
+                    .map_err(|e| format!("failed writing request body: {e:?}"))?;
+            }
         }
         OutgoingBody::finish(body, None)
             .map_err(|e| format!("failed finishing request body: {e:?}"))?;
     }
-
-    let future_response = outgoing_handler::handle(request, None)
-        .map_err(|e| format!("failed to send request: {e:?}"))?;
 
     // Block until the response is ready.
     loop {

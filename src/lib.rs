@@ -214,10 +214,12 @@ fn respond(
     content_type: &str,
     body: &[u8],
     extra_headers: &[(&'static str, String)],
+    content_length: Option<u64>,
 ) {
     let headers = Fields::new();
     let _ = headers.append("content-type", content_type.as_bytes());
-    let _ = headers.append("content-length", body.len().to_string().as_bytes());
+    let length = content_length.unwrap_or(body.len() as u64);
+    let _ = headers.append("content-length", length.to_string().as_bytes());
     for (name, value) in extra_headers {
         let _ = headers.append(name, value.as_bytes());
     }
@@ -312,13 +314,13 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
         Method::Options => DavResponse::options(),
         Method::Head => dav::head(&config, &path),
         Method::Get => dav::get(&config, &path),
-        Method::Put => match read_request_body(request, graph::MAX_SIMPLE_UPLOAD_BYTES) {
+        Method::Put => match read_request_body(request, graph::MAX_UPLOAD_BYTES) {
             Ok(body) => dav::put(&config, &path, &body),
             Err(BodyError::TooLarge) => DavResponse::error(
                 413,
                 format!(
-                    "file exceeds the {} byte simple-upload limit of this build",
-                    graph::MAX_SIMPLE_UPLOAD_BYTES
+                    "file exceeds the {} byte upload limit of this build",
+                    graph::MAX_UPLOAD_BYTES
                 ),
             ),
             Err(BodyError::Read(e)) => DavResponse::error(400, e),
@@ -345,9 +347,10 @@ impl Guest for Component {
         respond(
             response_out,
             result.status,
-            result.content_type,
+            &result.content_type,
             &result.body,
             &result.headers,
+            result.content_length,
         );
     }
 }

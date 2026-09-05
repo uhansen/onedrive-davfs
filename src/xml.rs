@@ -122,7 +122,7 @@ fn response_xml(entry: &DavEntry) -> String {
     <D:prop>
       <D:resourcetype>{resourcetype}</D:resourcetype>
       <D:getlastmodified>{last_modified}</D:getlastmodified>
-      <D:getetag>&quot;{etag}&quot;</D:getetag>
+      <D:getetag>{etag}</D:getetag>
       {content_length}
     </D:prop>
     <D:status>HTTP/1.1 200 OK</D:status>
@@ -131,9 +131,19 @@ fn response_xml(entry: &DavEntry) -> String {
         href = href,
         resourcetype = resourcetype,
         last_modified = http_date(entry.last_modified),
-        etag = xml_escape(&entry.etag),
+        etag = quoted_etag_xml(&entry.etag),
         content_length = content_length,
     )
+}
+
+/// Graph etags often already include surrounding quotes; wrap exactly once.
+fn quoted_etag_xml(etag: &str) -> String {
+    let inner = etag.trim();
+    let inner = inner
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(inner);
+    format!("&quot;{}&quot;", xml_escape(inner))
 }
 
 /// Builds a full `207 Multi-Status` PROPFIND response body for one or more
@@ -252,5 +262,27 @@ mod tests {
         assert!(pct_decode("bad%2").is_none());
         assert!(pct_decode("bad%zz").is_none());
         assert!(pct_decode("%ff").is_none());
+    }
+
+    #[test]
+    fn getetag_does_not_double_quote_graph_etags() {
+        let quoted = DavEntry {
+            href: "/a".to_string(),
+            is_dir: false,
+            size: 1,
+            last_modified: 0,
+            etag: "\"{641B},5\"".to_string(),
+        };
+        let bare = DavEntry {
+            href: "/b".to_string(),
+            is_dir: false,
+            size: 1,
+            last_modified: 0,
+            etag: "abc123".to_string(),
+        };
+        let xml = multistatus(&[quoted, bare]);
+        assert!(xml.contains("<D:getetag>&quot;{641B},5&quot;</D:getetag>"));
+        assert!(xml.contains("<D:getetag>&quot;abc123&quot;</D:getetag>"));
+        assert!(!xml.contains("&quot;&quot;"));
     }
 }

@@ -14,9 +14,14 @@ use crate::config::Config;
 use crate::http_client::{self, HttpRequest};
 
 /// Graph's simple (non-chunked) upload only supports files up to ~4 MiB.
-/// Anything bigger needs a resumable upload session, which is explicitly
-/// out of scope for this first pass.
+/// Larger files go through `createUploadSession` + chunked `Content-Range`.
 pub const MAX_SIMPLE_UPLOAD_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Hard ceiling on a single `PUT`: the whole body is buffered in the guest.
+pub const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Graph upload-session chunks must be a multiple of 320 KiB except the last.
+const UPLOAD_CHUNK_BYTES: usize = 10 * 1024 * 1024;
 
 pub struct GraphItem {
     pub name: String,
@@ -25,6 +30,8 @@ pub struct GraphItem {
     /// Unix seconds.
     pub last_modified: u64,
     pub etag: String,
+    /// Graph `file.mimeType`, empty for folders or when Graph omits it.
+    pub mime_type: String,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +45,14 @@ struct DriveItem {
     last_modified: Option<String>,
     #[serde(rename = "eTag", default)]
     etag: Option<String>,
+    #[serde(default)]
+    file: Option<FileFacet>,
+}
+
+#[derive(Deserialize)]
+struct FileFacet {
+    #[serde(rename = "mimeType", default)]
+    mime_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +166,11 @@ fn to_item(item: &DriveItem) -> GraphItem {
             .map(parse_iso8601_to_unix)
             .unwrap_or(0),
         etag: item.etag.clone().unwrap_or_default(),
+        mime_type: item
+            .file
+            .as_ref()
+            .and_then(|f| f.mime_type.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -229,41 +249,11 @@ fn validate_next_link(next: &str, pages_so_far: usize) -> Result<String, String>
 
 const GRAPH_ORIGIN: &str = "https://graph.microsoft.com/";
 
-/// Hosts Graph uses for pre-authenticated `/content` download redirects.
-/// Matched exactly or as a DNS suffix (so `foo.sharepoint.com` is allowed
-/// but `sharepoint.com.evil.example` is not). Bearer is never attached.
-fn is_allowed_download_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
-    };
-    let hostport = rest.split('/').next().unwrap_or("");
-    let host = if let Some(inner) = hostport.strip_prefix('[') {
-        inner.split(']').next().unwrap_or("")
-    } else {
-        hostport
-            .rsplit_once(':')
-            .filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
-            .map(|(h, _)| h)
-            .unwrap_or(hostport)
-    };
-    let host = host.to_ascii_lowercase();
-    const ALLOWED: &[&str] = &[
-        "graph.microsoft.com",
-        "microsoftpersonalcontent.com",
-        "sharepoint.com",
-        "sharepointonline.com",
-        "onedrive.com",
-        "live.com",
-        "live.net",
-        "1drv.com",
-        "1drv.ms",
-        "office.com",
-        "office365.com",
-        "blob.core.windows.net",
-    ];
-    ALLOWED
-        .iter()
-        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+/// Pre-authenticated download/upload URLs are followed without the bearer.
+/// Graph routes them through per-tenant/region hosts that change over time,
+/// so the only pin is `https://` (single hop; Location comes from Graph over TLS).
+fn is_https_url(url: &str) -> bool {
+    url.starts_with("https://")
 }
 
 pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
@@ -278,9 +268,10 @@ pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
             let location = response
                 .header_value("location")
                 .ok_or_else(|| "graph get_content redirect missing Location header".to_string())?;
-            if !is_allowed_download_url(&location) {
+            let location = location.trim();
+            if !is_https_url(location) {
                 return Err(format!(
-                    "graph get_content redirect to unsupported URL: {location}"
+                    "graph get_content redirect is not https: {location}"
                 ));
             }
 
@@ -305,18 +296,21 @@ pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Direct (simple) upload -- callers must check `MAX_SIMPLE_UPLOAD_BYTES`
-/// first; larger files are rejected explicitly rather than silently
-/// truncated (chunked/resumable upload sessions are a follow-up).
 pub fn put_content(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() as u64 > MAX_SIMPLE_UPLOAD_BYTES {
+    if bytes.len() as u64 > MAX_UPLOAD_BYTES {
         return Err(format!(
-            "file is {} bytes, larger than this build's {}-byte simple upload limit \
-             (chunked upload sessions are not implemented yet)",
+            "file is {} bytes, larger than this build's {}-byte upload limit",
             bytes.len(),
-            MAX_SIMPLE_UPLOAD_BYTES
+            MAX_UPLOAD_BYTES
         ));
     }
+    if bytes.len() as u64 > MAX_SIMPLE_UPLOAD_BYTES {
+        return put_chunked(config, path, bytes);
+    }
+    put_simple(config, path, bytes)
+}
+
+fn put_simple(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}/content",
         item_path_segment(&config.drive_base, path)
@@ -336,6 +330,92 @@ pub fn put_content(config: &Config, path: &str, bytes: &[u8]) -> Result<(), Stri
         ));
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct UploadSession {
+    #[serde(rename = "uploadUrl")]
+    upload_url: String,
+}
+
+fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> {
+    let url = format!(
+        "https://graph.microsoft.com/v1.0{}/createUploadSession",
+        item_path_segment(&config.drive_base, path)
+    );
+    let body = serde_json::json!({
+        "item": {
+            "@microsoft.graph.conflictBehavior": "replace"
+        }
+    });
+    let response = graph_request(
+        config,
+        Method::Post,
+        &url,
+        Some("application/json"),
+        body.to_string().as_bytes(),
+    )?;
+    if response.status != 200 && response.status != 201 {
+        return Err(format!(
+            "graph createUploadSession failed with status {}: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        ));
+    }
+    let session: UploadSession = serde_json::from_slice(&response.body)
+        .map_err(|e| format!("failed to parse upload session: {e}"))?;
+    let upload_url = session.upload_url.trim().to_string();
+    if !is_https_url(&upload_url) {
+        return Err("graph createUploadSession returned a non-https uploadUrl".to_string());
+    }
+
+    let total = bytes.len();
+    let mut offset = 0;
+    let result = (|| {
+        while offset < total {
+            let end = (offset + UPLOAD_CHUNK_BYTES).min(total);
+            let chunk = &bytes[offset..end];
+            let range = format!("bytes {offset}-{}/{}", end - 1, total);
+            let content_length = chunk.len().to_string();
+            let sent = http_client::send(HttpRequest {
+                method: Method::Put,
+                url: &upload_url,
+                headers: &[
+                    ("content-range", range.as_str()),
+                    ("content-length", content_length.as_str()),
+                    ("content-type", "application/octet-stream"),
+                ],
+                body: chunk,
+            })?;
+            let last = end == total;
+            let ok = if last {
+                sent.status == 200 || sent.status == 201
+            } else {
+                sent.status == 202
+            };
+            if !ok {
+                return Err(format!(
+                    "graph upload session chunk {}-{} failed with status {}: {}",
+                    offset,
+                    end - 1,
+                    sent.status,
+                    String::from_utf8_lossy(&sent.body)
+                ));
+            }
+            offset = end;
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = http_client::send(HttpRequest {
+            method: Method::Delete,
+            url: &upload_url,
+            headers: &[],
+            body: &[],
+        });
+    }
+    result
 }
 
 pub fn create_folder(config: &Config, parent_path: &str, name: &str) -> Result<(), String> {
@@ -478,25 +558,17 @@ mod tests {
     }
 
     #[test]
-    fn download_redirect_hosts_are_pinned() {
-        assert!(is_allowed_download_url(
-            "https://mytenant.sharepoint.com/sites/x/_layouts/download.aspx?x=1"
-        ));
-        assert!(is_allowed_download_url(
-            "https://graph.microsoft.com/v1.0/me/drive/items/id/content"
-        ));
-        assert!(is_allowed_download_url(
-            "https://bn.files.1drv.com/y4mABC/file.bin"
-        ));
-        assert!(is_allowed_download_url(
+    fn download_redirect_requires_https() {
+        assert!(is_https_url(
             "https://my.microsoftpersonalcontent.com/personal/x/_layouts/15/download.aspx?x=1"
         ));
-        assert!(!is_allowed_download_url("http://sharepoint.com/x"));
-        assert!(!is_allowed_download_url("https://evil.example/x"));
-        assert!(!is_allowed_download_url(
-            "https://sharepoint.com.evil.example/x"
+        assert!(is_https_url(
+            "https://mytenant.sharepoint.com/sites/x/_layouts/download.aspx?x=1"
         ));
-        assert!(!is_allowed_download_url("https://notsharepoint.com/x"));
+        assert!(is_https_url("https://evil.example/x"));
+        assert!(!is_https_url("http://sharepoint.com/x"));
+        assert!(!is_https_url("javascript:alert(1)"));
+        assert!(!is_https_url(""));
     }
 
     #[test]
