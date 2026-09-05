@@ -13,6 +13,7 @@ use bindings::exports::wasi::http::incoming_handler::Guest;
 use bindings::wasi::http::types::{
     ErrorCode, Fields, IncomingRequest, Method, OutgoingBody, OutgoingResponse, ResponseOutparam,
 };
+use bindings::wasi::io::streams::StreamError;
 
 use config::Config;
 use dav::DavResponse;
@@ -63,7 +64,10 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    let clean: Vec<u8> = input.bytes().filter(|&b| b != b'=' && !b.is_ascii_whitespace()).collect();
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|&b| b != b'=' && !b.is_ascii_whitespace())
+        .collect();
     let mut out = Vec::with_capacity(clean.len() * 3 / 4);
     for chunk in clean.chunks(4) {
         let vals: Vec<u8> = chunk.iter().map(|&b| val(b)).collect::<Option<Vec<_>>>()?;
@@ -125,10 +129,19 @@ fn destination_path(raw: &str) -> String {
     }
 }
 
-fn respond(response_out: ResponseOutparam, status: u16, content_type: &str, body: &[u8]) {
+fn respond(
+    response_out: ResponseOutparam,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(&'static str, String)],
+) {
     let headers = Fields::new();
     let _ = headers.append("content-type", content_type.as_bytes());
     let _ = headers.append("content-length", body.len().to_string().as_bytes());
+    for (name, value) in extra_headers {
+        let _ = headers.append(name, value.as_bytes());
+    }
 
     let response = OutgoingResponse::new(headers);
     if response.set_status_code(status).is_err() {
@@ -158,7 +171,27 @@ fn respond(response_out: ResponseOutparam, status: u16, content_type: &str, body
 
     if !body.is_empty() {
         if let Ok(stream) = outgoing_body.write() {
-            let _ = stream.blocking_write_and_flush(body);
+            let pollable = stream.subscribe();
+            let mut offset = 0;
+            while offset < body.len() {
+                bindings::wasi::io::poll::poll(&[&pollable]);
+                let permit = match stream.check_write() {
+                    Ok(n) => n as usize,
+                    Err(StreamError::Closed) => break,
+                    Err(StreamError::LastOperationFailed(_)) => break,
+                };
+                if permit == 0 {
+                    continue;
+                }
+                let end = (offset + permit).min(body.len());
+                match stream.write(&body[offset..end]) {
+                    Ok(()) => offset = end,
+                    Err(StreamError::Closed) => break,
+                    Err(StreamError::LastOperationFailed(_)) => break,
+                }
+            }
+            let _ = stream.flush();
+            let _ = stream.blocking_flush();
         }
     }
     let _ = OutgoingBody::finish(outgoing_body, None);
@@ -180,13 +213,15 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
     let headers = request.headers();
 
     if !check_basic_auth(&config, &headers) {
-        return DavResponse::error(401, "unauthorized");
+        return DavResponse::unauthorized();
     }
 
     let depth = header_value(&headers, "depth");
     let destination = header_value(&headers, "destination").map(|d| destination_path(&d));
 
     match request.method() {
+        Method::Options => DavResponse::options(),
+        Method::Head => dav::head(&config, &path),
         Method::Get => dav::get(&config, &path),
         Method::Put => match read_request_body(request) {
             Ok(body) => dav::put(&config, &path, &body),
@@ -216,6 +251,7 @@ impl Guest for Component {
             result.status,
             result.content_type,
             &result.body,
+            &result.headers,
         );
     }
 }

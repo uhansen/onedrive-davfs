@@ -11,6 +11,7 @@ pub struct DavResponse {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
+    pub headers: Vec<(&'static str, String)>,
 }
 
 impl DavResponse {
@@ -19,6 +20,7 @@ impl DavResponse {
             status,
             content_type: "application/xml; charset=utf-8",
             body: body.into_bytes(),
+            headers: Vec::new(),
         }
     }
 
@@ -27,6 +29,7 @@ impl DavResponse {
             status,
             content_type: "text/plain",
             body: Vec::new(),
+            headers: Vec::new(),
         }
     }
 
@@ -35,6 +38,35 @@ impl DavResponse {
             status,
             content_type: "text/plain",
             body: message.into().into_bytes(),
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn unauthorized() -> Self {
+        DavResponse {
+            status: 401,
+            content_type: "text/plain",
+            body: b"unauthorized".to_vec(),
+            headers: vec![(
+                "www-authenticate",
+                r#"Basic realm="onedrive-davfs""#.to_string(),
+            )],
+        }
+    }
+
+    pub fn options() -> Self {
+        DavResponse {
+            status: 200,
+            content_type: "text/plain",
+            body: Vec::new(),
+            headers: vec![
+                (
+                    "allow",
+                    "OPTIONS, PROPFIND, GET, PUT, MKCOL, DELETE, MOVE, LOCK, UNLOCK".to_string(),
+                ),
+                ("dav", "1, 2".to_string()),
+                ("ms-author-via", "DAV".to_string()),
+            ],
         }
     }
 }
@@ -101,7 +133,16 @@ pub fn get(config: &Config, path: &str) -> DavResponse {
             status: 200,
             content_type: "application/octet-stream",
             body: bytes,
+            headers: Vec::new(),
         },
+        Err(e) => DavResponse::error(502, e),
+    }
+}
+
+pub fn head(config: &Config, path: &str) -> DavResponse {
+    match graph::stat(config, path) {
+        Ok(_) => DavResponse::empty(200),
+        Err(e) if e == "not found" => DavResponse::empty(404),
         Err(e) => DavResponse::error(502, e),
     }
 }
@@ -125,7 +166,11 @@ pub fn put(config: &Config, path: &str, body: &[u8]) -> DavResponse {
 
 pub fn mkcol(config: &Config, path: &str) -> DavResponse {
     let parent = parent_of(path);
-    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path);
+    let name = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path);
     match graph::create_folder(config, &parent, name) {
         Ok(()) => DavResponse::empty(201),
         Err(e) => DavResponse::error(502, e),
