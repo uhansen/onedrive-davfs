@@ -10,8 +10,7 @@ permissions:
   contents: read
 
 env:
-  COMPONENT_PATH: target/wasm32-wasip1/release/onedrive_davfs.wasm
-  CARGO_COMPONENT_VERSION: 0.21.1
+  COMPONENT_PATH: target/wasm32-wasip2/release/onedrive_davfs.wasm
   WASM_TOOLS_VERSION: 1.244.0
 
 jobs:
@@ -31,9 +30,6 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-component
-        run: cargo install cargo-component --version "${CARGO_COMPONENT_VERSION}" --locked
-
       - name: Install wasm-tools
         run: cargo install wasm-tools --version "${WASM_TOOLS_VERSION}" --locked
 
@@ -47,7 +43,7 @@ jobs:
             | xargs rustfmt --check --edition 2024 --config skip_children=true
 
       - name: Build release component
-        run: cargo component build --release
+        run: cargo build --target wasm32-wasip2 --release
 
       - name: Validate WebAssembly component
         run: wasm-tools validate "${COMPONENT_PATH}"

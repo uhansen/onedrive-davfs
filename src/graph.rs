@@ -249,6 +249,7 @@ fn is_allowed_download_url(url: &str) -> bool {
     let host = host.to_ascii_lowercase();
     const ALLOWED: &[&str] = &[
         "graph.microsoft.com",
+        "microsoftpersonalcontent.com",
         "sharepoint.com",
         "sharepointonline.com",
         "onedrive.com",
@@ -486,6 +487,9 @@ mod tests {
         ));
         assert!(is_allowed_download_url(
             "https://bn.files.1drv.com/y4mABC/file.bin"
+        ));
+        assert!(is_allowed_download_url(
+            "https://my.microsoftpersonalcontent.com/personal/x/_layouts/15/download.aspx?x=1"
         ));
         assert!(!is_allowed_download_url("http://sharepoint.com/x"));
         assert!(!is_allowed_download_url("https://evil.example/x"));

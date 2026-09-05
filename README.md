@@ -100,7 +100,7 @@ each expiry.
 
 ```sh
 mkdir -p ~/.local/share/onedrive-davfs ~/.local/state/onedrive-davfs
-cp target/wasm32-wasip1/release/onedrive_davfs.wasm ~/.local/share/onedrive-davfs/
+cp target/wasm32-wasip2/release/onedrive_davfs.wasm ~/.local/share/onedrive-davfs/
 cp systemd/onedrive-davfs.service ~/.config/systemd/user/
 install -m 700 -d ~/.config/onedrive-davfs
 install -m 600 systemd/onedrive-davfs.env.example ~/.config/onedrive-davfs/env
@@ -152,9 +152,8 @@ systemctl --user enable --now onedrive-davfs-mount.service
 
 ```sh
 rustup target add wasm32-wasip2   # if not already installed
-cargo install cargo-component     # if not already installed
-cargo component build --release
-wasm-tools validate target/wasm32-wasip1/release/onedrive_davfs.wasm
+cargo build --target wasm32-wasip2 --release
+wasm-tools validate target/wasm32-wasip2/release/onedrive_davfs.wasm
 ```
 
 ## Testing
@@ -174,7 +173,7 @@ wasmtime serve --addr 127.0.0.1:8765 \
   --env ONEDRIVE_TENANT_ID=common \
   --env ONEDRIVE_CLIENT_ID=<id> \
   --env ONEDRIVE_BASIC_AUTH_SECRET="$SECRET" \
-  target/wasm32-wasip1/release/onedrive_davfs.wasm &
+  target/wasm32-wasip2/release/onedrive_davfs.wasm &
 curl -u "daemon:$SECRET" -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8765/
 ```
 

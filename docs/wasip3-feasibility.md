@@ -26,10 +26,8 @@ This repository is firmly on the Preview 2 stack today:
 - `wit/world.wit` includes `wasi:http/proxy@0.2.12`
 - `wit/world.wit` imports `wasi:filesystem/*@0.2.12` and
   `wasi:cli/environment@0.2.12`
-- `Cargo.toml` pins component target dependencies to:
-  - `wasi:filesystem = "0.2.3"`
-  - `wasi:cli = "0.2.3"`
-  - `wasi:http = "0.2.3"`
+- the checked-in `src/bindings.rs` and normal build now use plain
+  `cargo build --target wasm32-wasip2`, not `cargo-component`
 - `src/http_client.rs` is intentionally blocking and uses `wasi:io/poll`
   directly
 
@@ -135,7 +133,7 @@ updating the WIT world and regenerating bindings, not just changing Rust code.
 Repository sources:
 
 - `wit/world.wit`
-- `Cargo.toml`
+- `src/bindings.rs`
 
 ### 5. Wasmtime is ahead of the Rust guest story, but that is not enough
 

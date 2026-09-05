@@ -269,27 +269,25 @@ instead.
 Install the extra build prerequisites:
 
 - Rust with the `wasm32-wasip2` target
-- `cargo-component`
 - `wasm-tools`
 
 Example:
 
 ```sh
 rustup target add wasm32-wasip2
-cargo install cargo-component
 cargo install wasm-tools
 ```
 
 Build and validate:
 
 ```sh
-cargo component build --release
-wasm-tools validate target/wasm32-wasip1/release/onedrive_davfs.wasm
+cargo build --target wasm32-wasip2 --release
+wasm-tools validate target/wasm32-wasip2/release/onedrive_davfs.wasm
 ```
 
 Then copy the built component into place:
 
 ```sh
-install -m 644 target/wasm32-wasip1/release/onedrive_davfs.wasm \
+install -m 644 target/wasm32-wasip2/release/onedrive_davfs.wasm \
   ~/.local/share/onedrive-davfs/
 ```
