@@ -8,6 +8,8 @@ Linux, and is the intended eventual backend for the
 (that integration is a separate, later piece of work -- see "Non-goals"
 below).
 
+For a full install walkthrough, see [INSTALL.md](INSTALL.md).
+
 ## Why WebDAV instead of FUSE?
 
 WASI Preview 2 has no raw syscalls: no `/dev/fuse`, no `mount()`. A pure
