@@ -33,6 +33,7 @@ Environment=ONEDRIVE_TENANT_ID=common
 Environment=ONEDRIVE_DRIVE_BASE=me/drive
 Environment=ONEDRIVE_BASIC_AUTH_SECRET=REPLACE_ME
 ExecStart=%h/.local/bin/wasmtime serve \
+    -S cli=y \
     --addr 127.0.0.1:8765 \
     --dir %h/.local/state/onedrive-davfs::/state \
     %h/.local/share/onedrive-davfs/onedrive_davfs.wasm

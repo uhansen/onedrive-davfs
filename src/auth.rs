@@ -45,12 +45,9 @@ fn now_secs() -> u64 {
 }
 
 fn load(config: &Config) -> Result<TokenFile, String> {
-    let bytes = state_file::read_file(&config.state_dir, TOKEN_FILE)?
-        .ok_or_else(|| {
-            format!(
-                "no {TOKEN_FILE} found in state dir; run tools/device-code-login.sh first"
-            )
-        })?;
+    let bytes = state_file::read_file(&config.state_dir, TOKEN_FILE)?.ok_or_else(|| {
+        format!("no {TOKEN_FILE} found in state dir; run tools/device-code-login.sh first")
+    })?;
     serde_json::from_slice(&bytes).map_err(|e| format!("failed to parse {TOKEN_FILE}: {e}"))
 }
 
@@ -98,7 +95,9 @@ fn refresh(config: &Config, refresh_token: &str) -> Result<TokenFile, String> {
         // Graph AD rotates refresh tokens fairly often; persist whichever
         // one we were just handed, falling back to the one we sent if the
         // response omitted it.
-        refresh_token: parsed.refresh_token.unwrap_or_else(|| refresh_token.to_string()),
+        refresh_token: parsed
+            .refresh_token
+            .unwrap_or_else(|| refresh_token.to_string()),
         access_token: Some(parsed.access_token),
         expires_at: now_secs() + parsed.expires_in.saturating_sub(EXPIRY_SAFETY_MARGIN_SECS),
     })

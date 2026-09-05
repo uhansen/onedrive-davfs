@@ -34,8 +34,7 @@ impl Config {
     pub fn load() -> Result<Self, String> {
         let client_id = env("ONEDRIVE_CLIENT_ID");
         let tenant_id = env("ONEDRIVE_TENANT_ID").unwrap_or_else(|| "common".to_string());
-        let drive_base =
-            env("ONEDRIVE_DRIVE_BASE").unwrap_or_else(|| "me/drive".to_string());
+        let drive_base = env("ONEDRIVE_DRIVE_BASE").unwrap_or_else(|| "me/drive".to_string());
         let basic_auth_secret = env("ONEDRIVE_BASIC_AUTH_SECRET");
 
         let mut state_dir = None;
@@ -45,9 +44,8 @@ impl Config {
                 break;
             }
         }
-        let state_dir = state_dir.ok_or(
-            "no /state preopen found; run wasmtime with --dir <state-dir>::/state",
-        )?;
+        let state_dir = state_dir
+            .ok_or("no /state preopen found; run wasmtime with --dir <state-dir>::/state")?;
 
         Ok(Config {
             client_id,

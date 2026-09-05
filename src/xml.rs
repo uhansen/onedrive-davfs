@@ -34,7 +34,11 @@ pub struct DavEntry {
 pub fn http_date(unix_secs: u64) -> String {
     let days = (unix_secs / 86400) as i64;
     let secs_of_day = unix_secs % 86400;
-    let (hour, minute, second) = (secs_of_day / 3600, (secs_of_day / 60) % 60, secs_of_day % 60);
+    let (hour, minute, second) = (
+        secs_of_day / 3600,
+        (secs_of_day / 60) % 60,
+        secs_of_day % 60,
+    );
 
     let (year, month, day) = civil_from_days(days);
     let weekday = WEEKDAYS[(((days % 7) + 11) % 7) as usize]; // 1970-01-01 was a Thursday (index 4)
@@ -104,11 +108,7 @@ fn response_xml(entry: &DavEntry) -> String {
     } else {
         href
     };
-    let resourcetype = if entry.is_dir {
-        "<D:collection/>"
-    } else {
-        ""
-    };
+    let resourcetype = if entry.is_dir { "<D:collection/>" } else { "" };
     let content_length = if entry.is_dir {
         String::new()
     } else {
@@ -139,7 +139,11 @@ fn response_xml(entry: &DavEntry) -> String {
 /// Builds a full `207 Multi-Status` PROPFIND response body for one or more
 /// entries (the resource itself, plus children when `Depth: 1`).
 pub fn multistatus(entries: &[DavEntry]) -> String {
-    let body: String = entries.iter().map(response_xml).collect::<Vec<_>>().join("\n");
+    let body: String = entries
+        .iter()
+        .map(response_xml)
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:">

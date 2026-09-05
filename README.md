@@ -105,6 +105,11 @@ the daemon can start **without** `ONEDRIVE_CLIENT_ID` and use that token
 directly. `ONEDRIVE_CLIENT_ID` becomes mandatory only when the daemon needs
 to refresh an expired token.
 
+`ONEDRIVE_DRIVE_BASE` defaults to `me/drive`, which targets the signed-in
+account's primary drive. You can also set it to a plain drive ID
+(`B087983F641B9ED3`) or another Graph drive selector such as
+`users/<user-id>/drive`.
+
 ### 4. Mount with davfs2
 
 ```sh
@@ -149,6 +154,7 @@ Manual smoke test once a token is in place:
 
 ```sh
 wasmtime serve --addr 127.0.0.1:8765 \
+  -S cli=y \
   --dir ~/.local/state/onedrive-davfs::/state \
   --env ONEDRIVE_TENANT_ID=common \
   --env ONEDRIVE_CLIENT_ID=<id> \

@@ -8,9 +8,7 @@
 //! `send()` helper below instead of building requests by hand.
 
 use crate::bindings::wasi::http::outgoing_handler;
-use crate::bindings::wasi::http::types::{
-    Fields, Method, OutgoingBody, OutgoingRequest, Scheme,
-};
+use crate::bindings::wasi::http::types::{Fields, Method, OutgoingBody, OutgoingRequest, Scheme};
 use crate::bindings::wasi::io::poll;
 
 pub struct HttpRequest<'a> {
@@ -23,7 +21,17 @@ pub struct HttpRequest<'a> {
 
 pub struct HttpResponse {
     pub status: u16,
+    pub headers: Vec<(String, Vec<u8>)>,
     pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    pub fn header_value(&self, name: &str) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| String::from_utf8_lossy(value).into_owned())
+    }
 }
 
 /// Splits an absolute `https://host[:port]/path?query` URL into
@@ -94,15 +102,33 @@ pub fn send(req: HttpRequest) -> Result<HttpResponse, String> {
                 .map_err(|_| "response already consumed".to_string())?
                 .map_err(|e| format!("transport error: {e:?}"))?;
             let status = response.status();
+            let headers = read_headers(&response);
             let body = read_body(&response)?;
-            return Ok(HttpResponse { status, body });
+            return Ok(HttpResponse {
+                status,
+                headers,
+                body,
+            });
         }
         let pollable = future_response.subscribe();
         poll::poll(&[&pollable]);
     }
 }
 
-fn read_body(response: &crate::bindings::wasi::http::types::IncomingResponse) -> Result<Vec<u8>, String> {
+fn read_headers(
+    response: &crate::bindings::wasi::http::types::IncomingResponse,
+) -> Vec<(String, Vec<u8>)> {
+    response
+        .headers()
+        .entries()
+        .into_iter()
+        .map(|(name, value)| (name, value))
+        .collect()
+}
+
+fn read_body(
+    response: &crate::bindings::wasi::http::types::IncomingResponse,
+) -> Result<Vec<u8>, String> {
     let incoming_body = response
         .consume()
         .map_err(|_| "failed to consume response body".to_string())?;
@@ -128,4 +154,26 @@ fn read_body(response: &crate::bindings::wasi::http::types::IncomingResponse) ->
         }
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_value_is_case_insensitive() {
+        let response = HttpResponse {
+            status: 302,
+            headers: vec![(
+                "Location".to_string(),
+                b"https://example.test/file".to_vec(),
+            )],
+            body: Vec::new(),
+        };
+
+        assert_eq!(
+            response.header_value("location").as_deref(),
+            Some("https://example.test/file")
+        );
+    }
 }

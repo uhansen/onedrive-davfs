@@ -3,8 +3,9 @@
 //! fresh bearer token from `auth::bearer_token`.
 //!
 //! Paths are POSIX-style (`/Documents/report.docx`, `""` for the drive
-//! root) and are translated to Graph's
-//! `/drives/{drive}/root:/path/to/item:` addressing form.
+//! root) and are translated to Graph item URLs under either a drive id
+//! (`/drives/{drive-id}/root:/path/to/item:`) or a selector such as
+//! `/me/drive/root:/path/to/item:`.
 
 use serde::Deserialize;
 
@@ -73,14 +74,23 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146097 + doe as i64 - 719468
 }
 
-fn item_path_segment(config: &Config, path: &str) -> String {
+fn drive_root_segment(drive_base: &str) -> String {
+    let trimmed = drive_base.trim_matches('/');
+    if trimmed.contains('/') {
+        format!("/{trimmed}")
+    } else {
+        format!("/drives/{trimmed}")
+    }
+}
+
+fn item_path_segment(drive_base: &str, path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
+    let drive_root = drive_root_segment(drive_base);
     if trimmed.is_empty() {
-        format!("/drives/{}/root", config.drive_base)
+        format!("{drive_root}/root")
     } else {
         format!(
-            "/drives/{}/root:/{}:",
-            config.drive_base,
+            "{drive_root}/root:/{}:",
             trimmed
                 .split('/')
                 .map(crate::xml::pct_encode)
@@ -128,7 +138,7 @@ fn to_item(item: &DriveItem) -> GraphItem {
 pub fn stat(config: &Config, path: &str) -> Result<GraphItem, String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}",
-        item_path_segment(config, path)
+        item_path_segment(&config.drive_base, path)
     );
     let response = graph_request(config, Method::Get, &url, None, &[])?;
     if response.status == 404 {
@@ -151,7 +161,7 @@ pub fn stat(config: &Config, path: &str) -> Result<GraphItem, String> {
 pub fn children(config: &Config, path: &str) -> Result<Vec<GraphItem>, String> {
     let mut url = format!(
         "https://graph.microsoft.com/v1.0{}/children?$top=200",
-        item_path_segment(config, path)
+        item_path_segment(&config.drive_base, path)
     );
     let mut items = Vec::new();
     loop {
@@ -177,16 +187,40 @@ pub fn children(config: &Config, path: &str) -> Result<Vec<GraphItem>, String> {
 pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}/content",
-        item_path_segment(config, path)
+        item_path_segment(&config.drive_base, path)
     );
     let response = graph_request(config, Method::Get, &url, None, &[])?;
-    if response.status != 200 {
-        return Err(format!(
+    match response.status {
+        200 => Ok(response.body),
+        301 | 302 | 303 | 307 | 308 => {
+            let location = response
+                .header_value("location")
+                .ok_or_else(|| "graph get_content redirect missing Location header".to_string())?;
+            if !location.starts_with("https://") {
+                return Err(format!(
+                    "graph get_content redirect to unsupported URL: {location}"
+                ));
+            }
+
+            let redirected = http_client::send(HttpRequest {
+                method: Method::Get,
+                url: &location,
+                headers: &[],
+                body: &[],
+            })?;
+            if redirected.status != 200 {
+                return Err(format!(
+                    "graph redirected get_content failed with status {}",
+                    redirected.status
+                ));
+            }
+            Ok(redirected.body)
+        }
+        _ => Err(format!(
             "graph get_content failed with status {}",
             response.status
-        ));
+        )),
     }
-    Ok(response.body)
 }
 
 /// Direct (simple) upload -- callers must check `MAX_SIMPLE_UPLOAD_BYTES`
@@ -203,7 +237,7 @@ pub fn put_content(config: &Config, path: &str, bytes: &[u8]) -> Result<(), Stri
     }
     let url = format!(
         "https://graph.microsoft.com/v1.0{}/content",
-        item_path_segment(config, path)
+        item_path_segment(&config.drive_base, path)
     );
     let response = graph_request(
         config,
@@ -225,7 +259,7 @@ pub fn put_content(config: &Config, path: &str, bytes: &[u8]) -> Result<(), Stri
 pub fn create_folder(config: &Config, parent_path: &str, name: &str) -> Result<(), String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}/children",
-        item_path_segment(config, parent_path)
+        item_path_segment(&config.drive_base, parent_path)
     );
     let body = serde_json::json!({
         "name": name,
@@ -252,11 +286,14 @@ pub fn create_folder(config: &Config, parent_path: &str, name: &str) -> Result<(
 pub fn delete(config: &Config, path: &str) -> Result<(), String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}",
-        item_path_segment(config, path)
+        item_path_segment(&config.drive_base, path)
     );
     let response = graph_request(config, Method::Delete, &url, None, &[])?;
     if response.status != 204 && response.status != 404 {
-        return Err(format!("graph delete failed with status {}", response.status));
+        return Err(format!(
+            "graph delete failed with status {}",
+            response.status
+        ));
     }
     Ok(())
 }
@@ -267,7 +304,7 @@ pub fn delete(config: &Config, path: &str) -> Result<(), String> {
 pub fn move_or_rename(config: &Config, from_path: &str, to_path: &str) -> Result<(), String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}",
-        item_path_segment(config, from_path)
+        item_path_segment(&config.drive_base, from_path)
     );
     let new_name = to_path.rsplit('/').next().unwrap_or(to_path);
     let new_parent = match to_path.rfind('/') {
@@ -321,5 +358,27 @@ mod tests {
     fn days_from_civil_matches_epoch() {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2026, 1, 12), 20465);
+    }
+
+    #[test]
+    fn drive_root_segment_supports_default_me_drive_selector() {
+        assert_eq!(drive_root_segment("me/drive"), "/me/drive");
+    }
+
+    #[test]
+    fn drive_root_segment_supports_explicit_drive_id() {
+        assert_eq!(
+            drive_root_segment("B087983F641B9ED3"),
+            "/drives/B087983F641B9ED3"
+        );
+    }
+
+    #[test]
+    fn item_path_segment_preserves_graph_selector_shape() {
+        assert_eq!(item_path_segment("me/drive", ""), "/me/drive/root");
+        assert_eq!(
+            item_path_segment("me/drive", "/Documents/report 1.docx"),
+            "/me/drive/root:/Documents/report%201.docx:"
+        );
     }
 }
