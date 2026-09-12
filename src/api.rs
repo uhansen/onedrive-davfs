@@ -26,7 +26,7 @@ pub fn status(config: &Config) -> DavResponse {
                 "ok": true,
                 "indexEnabled": true,
                 "error": e,
-            }))
+            }));
         }
     };
     let last_tick = match sync_stats::load(&config.state_dir) {
@@ -102,12 +102,8 @@ fn search_index(index: &index::Index, q: &str) -> serde_json::Value {
         .filter_map(|(id, node)| index.path_of(id).map(|path| (path, node)))
         .collect();
 
-    matches.sort_by(|(pa, na), (pb, nb)| {
-        nb.meta
-            .is_dir
-            .cmp(&na.meta.is_dir)
-            .then_with(|| pa.cmp(pb))
-    });
+    matches
+        .sort_by(|(pa, na), (pb, nb)| nb.meta.is_dir.cmp(&na.meta.is_dir).then_with(|| pa.cmp(pb)));
 
     let truncated = matches.len() > SEARCH_MAX_RESULTS;
     matches.truncate(SEARCH_MAX_RESULTS);
@@ -387,7 +383,10 @@ mod tests {
         let out = search_index(&idx, "Report.docx");
         let results = out["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["path"], serde_json::json!("/Documents/Report.docx"));
+        assert_eq!(
+            results[0]["path"],
+            serde_json::json!("/Documents/Report.docx")
+        );
         assert_eq!(results[0]["isDir"], serde_json::json!(false));
     }
 
@@ -405,7 +404,12 @@ mod tests {
         let mut idx = index::Index::default();
         idx.apply(root("r"));
         for i in 0..(SEARCH_MAX_RESULTS + 5) {
-            idx.apply(item(&format!("f{i}"), "r", &format!("match-{i}.txt"), false));
+            idx.apply(item(
+                &format!("f{i}"),
+                "r",
+                &format!("match-{i}.txt"),
+                false,
+            ));
         }
         let out = search_index(&idx, "match");
         assert_eq!(out["truncated"], serde_json::json!(true));

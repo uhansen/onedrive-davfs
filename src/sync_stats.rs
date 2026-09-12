@@ -28,8 +28,8 @@ pub fn save(dir: &Descriptor, stats: &SyncStats) -> Result<(), String> {
 pub fn load(dir: &Descriptor) -> Result<Option<SyncStats>, String> {
     match state_file::read_file(dir, STATS_FILE)? {
         Some(bytes) => {
-            let stats = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("sync_stats.json: {e}"))?;
+            let stats =
+                serde_json::from_slice(&bytes).map_err(|e| format!("sync_stats.json: {e}"))?;
             Ok(Some(stats))
         }
         None => Ok(None),
