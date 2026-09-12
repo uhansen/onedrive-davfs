@@ -105,6 +105,8 @@ install -d ~/.local/state/onedrive-davfs
 install -d ~/.config/systemd/user
 install -m 644 systemd/onedrive-davfs.service ~/.config/systemd/user/
 install -m 644 systemd/onedrive-davfs-mount.service ~/.config/systemd/user/
+install -m 644 systemd/onedrive-davfs-sync.service ~/.config/systemd/user/
+install -m 644 systemd/onedrive-davfs-sync.timer ~/.config/systemd/user/
 ```
 
 ## 6. Create the daemon environment file
@@ -150,6 +152,7 @@ Reload the user units and start the service:
 ```sh
 systemctl --user daemon-reload
 systemctl --user enable --now onedrive-davfs.service
+systemctl --user enable --now onedrive-davfs-sync.timer
 ```
 
 Check status:

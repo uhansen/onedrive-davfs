@@ -18,6 +18,11 @@ pub struct Config {
     /// Preopened directory used to persist `token.json`. Must be granted to
     /// the component via `wasmtime serve --dir <path>::/state`.
     pub state_dir: Descriptor,
+    /// Serve PROPFIND/HEAD from the local snapshot. `ONEDRIVE_INDEX_ENABLED=0`
+    /// restores live Graph listings.
+    pub index_enabled: bool,
+    pub sync_max_pages: usize,
+    pub sync_budget_ms: u64,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -39,6 +44,18 @@ impl Config {
             env("ONEDRIVE_BASIC_AUTH_SECRET"),
             env("ONEDRIVE_ALLOW_UNAUTHENTICATED").as_deref() == Some("1"),
         )?;
+        let index_enabled = match env("ONEDRIVE_INDEX_ENABLED").as_deref() {
+            Some("0") | Some("false") | Some("FALSE") => false,
+            _ => true,
+        };
+        let sync_max_pages = env("ONEDRIVE_SYNC_MAX_PAGES")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+            .max(1);
+        let sync_budget_ms = env("ONEDRIVE_SYNC_BUDGET_MS")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000)
+            .max(1);
 
         let mut state_dir = None;
         for (descriptor, path) in preopens::get_directories() {
@@ -56,6 +73,9 @@ impl Config {
             drive_base,
             basic_auth_secret,
             state_dir,
+            index_enabled,
+            sync_max_pages,
+            sync_budget_ms,
         })
     }
 }

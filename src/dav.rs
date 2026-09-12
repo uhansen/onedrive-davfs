@@ -5,6 +5,8 @@
 
 use crate::config::Config;
 use crate::graph;
+use crate::index::{self, DeltaItem, ItemMeta};
+use crate::snapshot::{self, ChildInfo, Lookup};
 use crate::xml::{self, DavEntry};
 
 pub struct DavResponse {
@@ -107,6 +109,10 @@ pub fn propfind(config: &Config, path: &str, depth: Option<&str>) -> DavResponse
         );
     }
 
+    if let Some(resp) = propfind_from_index(config, path, depth) {
+        return resp;
+    }
+
     let self_item = match graph::stat(config, path) {
         Ok(item) => item,
         Err(e) if e == "not found" => return DavResponse::empty(404),
@@ -132,6 +138,48 @@ pub fn propfind(config: &Config, path: &str, depth: Option<&str>) -> DavResponse
     DavResponse::xml(207, xml::multistatus(&entries))
 }
 
+fn propfind_from_index(config: &Config, path: &str, depth: Option<&str>) -> Option<DavResponse> {
+    if !config.index_enabled {
+        return None;
+    }
+    let hit = match snapshot::lookup_file(&config.state_dir, path) {
+        Ok(Some(h)) => h,
+        _ => return None,
+    };
+    let entries = match hit {
+        Lookup::Dir { info, children } => {
+            let mut entries = vec![entry_from_info(path, &info, true)];
+            if depth != Some("0") {
+                entries.extend(children.iter().map(|c| entry_from_info(path, c, false)));
+            }
+            entries
+        }
+        Lookup::File(info) => vec![entry_from_info(path, &info, true)],
+    };
+    Some(DavResponse::xml(207, xml::multistatus(&entries)))
+}
+
+fn entry_from_info(path: &str, info: &ChildInfo, is_self: bool) -> DavEntry {
+    let href = if is_self {
+        if path.trim_matches('/').is_empty() {
+            "/".to_string()
+        } else {
+            index::normalize_path(path)
+        }
+    } else if path.trim_matches('/').is_empty() {
+        format!("/{}", info.name)
+    } else {
+        format!("{}/{}", path.trim_end_matches('/'), info.name)
+    };
+    DavEntry {
+        href,
+        is_dir: info.is_dir,
+        size: info.size,
+        last_modified: info.mtime,
+        etag: info.etag.clone(),
+    }
+}
+
 fn parent_of(path: &str) -> String {
     match path.trim_end_matches('/').rfind('/') {
         Some(idx) => path[..idx].to_string(),
@@ -153,6 +201,9 @@ pub fn get(config: &Config, path: &str) -> DavResponse {
 }
 
 pub fn head(config: &Config, path: &str) -> DavResponse {
+    if let Some(resp) = head_from_index(config, path) {
+        return resp;
+    }
     match graph::stat(config, path) {
         Ok(item) => {
             let content_type = if item.is_dir {
@@ -175,6 +226,53 @@ pub fn head(config: &Config, path: &str) -> DavResponse {
     }
 }
 
+fn head_from_index(config: &Config, path: &str) -> Option<DavResponse> {
+    if !config.index_enabled {
+        return None;
+    }
+    let hit = match snapshot::lookup_file(&config.state_dir, path) {
+        Ok(Some(h)) => h,
+        _ => return None,
+    };
+    let (is_dir, size) = match hit {
+        Lookup::Dir { info, .. } => (true, info.size),
+        Lookup::File(info) => (false, info.size),
+    };
+    Some(DavResponse {
+        status: 200,
+        content_type: if is_dir {
+            "httpd/unix-directory".to_string()
+        } else {
+            "application/octet-stream".to_string()
+        },
+        body: Vec::new(),
+        headers: Vec::new(),
+        content_length: Some(if is_dir { 0 } else { size }),
+    })
+}
+
+fn write_through(config: &Config, f: impl FnOnce(&mut crate::index::Index) -> bool) {
+    if !config.index_enabled {
+        return;
+    }
+    snapshot::mutate(&config.state_dir, f);
+}
+
+fn apply_or_upsert(
+    idx: &mut crate::index::Index,
+    item: Option<DeltaItem>,
+    path: &str,
+    meta: ItemMeta,
+) -> bool {
+    if let Some(it) = item {
+        idx.apply(it);
+        if idx.resolve(path).is_some() {
+            return true;
+        }
+    }
+    idx.upsert_at_path(path, meta)
+}
+
 pub fn put(config: &Config, path: &str, body: &[u8]) -> DavResponse {
     if body.len() as u64 > graph::MAX_UPLOAD_BYTES {
         return DavResponse::error(
@@ -187,7 +285,22 @@ pub fn put(config: &Config, path: &str, body: &[u8]) -> DavResponse {
         );
     }
     match graph::put_content(config, path, body) {
-        Ok(()) => DavResponse::empty(201),
+        Ok(item) => {
+            write_through(config, |idx| {
+                apply_or_upsert(
+                    idx,
+                    item,
+                    path,
+                    ItemMeta {
+                        is_dir: false,
+                        size: body.len() as u64,
+                        mtime: 0,
+                        etag: String::new(),
+                    },
+                )
+            });
+            DavResponse::empty(201)
+        }
         Err(e) => DavResponse::error(502, e),
     }
 }
@@ -200,14 +313,32 @@ pub fn mkcol(config: &Config, path: &str) -> DavResponse {
         .next()
         .unwrap_or(path);
     match graph::create_folder(config, &parent, name) {
-        Ok(()) => DavResponse::empty(201),
+        Ok(item) => {
+            write_through(config, |idx| {
+                apply_or_upsert(
+                    idx,
+                    item,
+                    path,
+                    ItemMeta {
+                        is_dir: true,
+                        size: 0,
+                        mtime: 0,
+                        etag: String::new(),
+                    },
+                )
+            });
+            DavResponse::empty(201)
+        }
         Err(e) => DavResponse::error(502, e),
     }
 }
 
 pub fn delete(config: &Config, path: &str) -> DavResponse {
     match graph::delete(config, path) {
-        Ok(()) => DavResponse::empty(204),
+        Ok(()) => {
+            write_through(config, |idx| idx.remove_at_path(path));
+            DavResponse::empty(204)
+        }
         Err(e) => DavResponse::error(502, e),
     }
 }
@@ -216,7 +347,18 @@ pub fn delete(config: &Config, path: &str) -> DavResponse {
 /// (host/scheme already stripped by `lib.rs`).
 pub fn r#move(config: &Config, path: &str, destination: &str) -> DavResponse {
     match graph::move_or_rename(config, path, destination) {
-        Ok(()) => DavResponse::empty(201),
+        Ok(item) => {
+            write_through(config, |idx| {
+                if let Some(it) = item {
+                    idx.apply(it);
+                    if idx.resolve(destination).is_some() {
+                        return true;
+                    }
+                }
+                idx.move_at_path(path, destination)
+            });
+            DavResponse::empty(201)
+        }
         Err(e) => DavResponse::error(502, e),
     }
 }

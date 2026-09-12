@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll Microsoft Graph /delta every 30s for onedrive-davfs
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=onedrive-davfs-sync.service
+
+[Install]
+WantedBy=timers.target
