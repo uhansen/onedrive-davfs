@@ -12,6 +12,7 @@ use serde::Deserialize;
 use crate::bindings::wasi::http::types::Method;
 use crate::config::Config;
 use crate::http_client::{self, HttpRequest};
+use crate::index::{DeltaItem, ItemMeta};
 
 /// Graph's simple (non-chunked) upload only supports files up to ~4 MiB.
 /// Larger files go through `createUploadSession` + chunked `Content-Range`.
@@ -36,6 +37,9 @@ pub struct GraphItem {
 
 #[derive(Deserialize)]
 struct DriveItem {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
     name: String,
     #[serde(default)]
     size: u64,
@@ -47,6 +51,20 @@ struct DriveItem {
     etag: Option<String>,
     #[serde(default)]
     file: Option<FileFacet>,
+    #[serde(rename = "parentReference", default)]
+    parent_reference: Option<ParentRef>,
+    #[serde(default)]
+    deleted: Option<serde_json::Value>,
+    #[serde(default)]
+    root: Option<serde_json::Value>,
+    #[serde(rename = "@removed", default)]
+    removed: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ParentRef {
+    #[serde(default)]
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -65,7 +83,7 @@ struct DriveItemPage {
 /// Converts an ISO-8601 Graph timestamp (`"2026-01-12T08:30:00Z"`) to Unix
 /// seconds. Deliberately tolerant: any parse failure returns `0` rather
 /// than failing the whole PROPFIND response over one bad timestamp.
-fn parse_iso8601_to_unix(s: &str) -> u64 {
+pub(crate) fn parse_iso8601_to_unix(s: &str) -> u64 {
     let digits: Vec<u32> = s
         .split(|c: char| !c.is_ascii_digit())
         .filter(|p| !p.is_empty())
@@ -172,6 +190,135 @@ fn to_item(item: &DriveItem) -> GraphItem {
             .and_then(|f| f.mime_type.clone())
             .unwrap_or_default(),
     }
+}
+
+fn to_delta_item(item: &DriveItem) -> Option<DeltaItem> {
+    if item.id.is_empty() {
+        return None;
+    }
+    Some(DeltaItem {
+        id: item.id.clone(),
+        parent_id: item
+            .parent_reference
+            .as_ref()
+            .filter(|p| !p.id.is_empty())
+            .map(|p| p.id.clone()),
+        name: item.name.clone(),
+        deleted: item.deleted.is_some() || item.removed.is_some(),
+        is_root: item.root.is_some(),
+        meta: ItemMeta {
+            is_dir: item.folder.is_some() || item.root.is_some(),
+            size: item.size,
+            mtime: item
+                .last_modified
+                .as_deref()
+                .map(parse_iso8601_to_unix)
+                .unwrap_or(0),
+            etag: item.etag.clone().unwrap_or_default(),
+        },
+    })
+}
+
+pub struct DeltaPage {
+    pub items: Vec<DeltaItem>,
+    pub next_link: Option<String>,
+    pub delta_token: Option<String>,
+}
+
+pub enum DeltaError {
+    Resync,
+    Other(String),
+}
+
+#[derive(Deserialize)]
+struct DeltaPageJson {
+    #[serde(default)]
+    value: Vec<DriveItem>,
+    #[serde(rename = "@odata.nextLink", default)]
+    next_link: Option<String>,
+    #[serde(rename = "@odata.deltaLink", default)]
+    delta_link: Option<String>,
+    #[serde(default)]
+    error: Option<GraphErrorBody>,
+}
+
+#[derive(Deserialize)]
+struct GraphErrorBody {
+    #[serde(default)]
+    code: String,
+}
+
+fn is_resync(status: u16, body: &[u8]) -> bool {
+    if status == 410 {
+        return true;
+    }
+    if let Ok(page) = serde_json::from_slice::<DeltaPageJson>(body) {
+        if page
+            .error
+            .as_ref()
+            .map(|e| e.code.eq_ignore_ascii_case("resyncRequired"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if v.pointer("/error/code")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.eq_ignore_ascii_case("resyncRequired"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn initial_delta_url(drive_base: &str) -> String {
+    format!(
+        "https://graph.microsoft.com/v1.0{}/root/delta?$select=id,name,size,folder,file,eTag,lastModifiedDateTime,parentReference,deleted,root&$top=200",
+        drive_root_segment(drive_base)
+    )
+}
+
+/// Fetches one delta page. `url` must be a `https://graph.microsoft.com/` link
+/// (either the initial crawl URL, a nextLink, or a deltaLink).
+pub fn delta(config: &Config, url: &str) -> Result<DeltaPage, DeltaError> {
+    let url = if url.starts_with(GRAPH_ORIGIN) {
+        url.to_string()
+    } else {
+        return Err(DeltaError::Other(
+            "delta url is not a graph.microsoft.com link".into(),
+        ));
+    };
+    let response = graph_request(config, Method::Get, &url, None, &[])
+        .map_err(DeltaError::Other)?;
+    if is_resync(response.status, &response.body) {
+        return Err(DeltaError::Resync);
+    }
+    if response.status != 200 {
+        return Err(DeltaError::Other(format!(
+            "graph delta failed with status {}: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        )));
+    }
+    parse_delta_page(&response.body).map_err(DeltaError::Other)
+}
+
+pub fn parse_delta_page(body: &[u8]) -> Result<DeltaPage, String> {
+    let page: DeltaPageJson =
+        serde_json::from_slice(body).map_err(|e| format!("failed to parse delta page: {e}"))?;
+    if let Some(next) = &page.next_link {
+        validate_next_link(next, 0)?;
+    }
+    if let Some(link) = &page.delta_link {
+        validate_next_link(link, 0)?;
+    }
+    Ok(DeltaPage {
+        items: page.value.iter().filter_map(to_delta_item).collect(),
+        next_link: page.next_link,
+        delta_token: page.delta_link,
+    })
 }
 
 /// Metadata for a single item (used to answer `PROPFIND Depth: 0`).
@@ -296,7 +443,7 @@ pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-pub fn put_content(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> {
+pub fn put_content(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaItem>, String> {
     if bytes.len() as u64 > MAX_UPLOAD_BYTES {
         return Err(format!(
             "file is {} bytes, larger than this build's {}-byte upload limit",
@@ -310,7 +457,7 @@ pub fn put_content(config: &Config, path: &str, bytes: &[u8]) -> Result<(), Stri
     put_simple(config, path, bytes)
 }
 
-fn put_simple(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> {
+fn put_simple(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaItem>, String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}/content",
         item_path_segment(&config.drive_base, path)
@@ -329,7 +476,9 @@ fn put_simple(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> {
             String::from_utf8_lossy(&response.body)
         ));
     }
-    Ok(())
+    Ok(serde_json::from_slice::<DriveItem>(&response.body)
+        .ok()
+        .and_then(|item| to_delta_item(&item)))
 }
 
 #[derive(Deserialize)]
@@ -338,7 +487,7 @@ struct UploadSession {
     upload_url: String,
 }
 
-fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> {
+fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaItem>, String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}/createUploadSession",
         item_path_segment(&config.drive_base, path)
@@ -372,6 +521,7 @@ fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> 
     let total = bytes.len();
     let mut offset = 0;
     let result = (|| {
+        let mut last_item = None;
         while offset < total {
             let end = (offset + UPLOAD_CHUNK_BYTES).min(total);
             let chunk = &bytes[offset..end];
@@ -402,9 +552,14 @@ fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> 
                     String::from_utf8_lossy(&sent.body)
                 ));
             }
+            if last {
+                last_item = serde_json::from_slice::<DriveItem>(&sent.body)
+                    .ok()
+                    .and_then(|item| to_delta_item(&item));
+            }
             offset = end;
         }
-        Ok(())
+        Ok(last_item)
     })();
 
     if result.is_err() {
@@ -418,7 +573,11 @@ fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<(), String> 
     result
 }
 
-pub fn create_folder(config: &Config, parent_path: &str, name: &str) -> Result<(), String> {
+pub fn create_folder(
+    config: &Config,
+    parent_path: &str,
+    name: &str,
+) -> Result<Option<DeltaItem>, String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}/children",
         item_path_segment(&config.drive_base, parent_path)
@@ -442,7 +601,9 @@ pub fn create_folder(config: &Config, parent_path: &str, name: &str) -> Result<(
             String::from_utf8_lossy(&response.body)
         ));
     }
-    Ok(())
+    Ok(serde_json::from_slice::<DriveItem>(&response.body)
+        .ok()
+        .and_then(|item| to_delta_item(&item)))
 }
 
 pub fn delete(config: &Config, path: &str) -> Result<(), String> {
@@ -463,7 +624,11 @@ pub fn delete(config: &Config, path: &str) -> Result<(), String> {
 /// Handles both rename-in-place and move-to-another-folder, since a
 /// WebDAV `MOVE` covers both (`dav.rs` just passes the destination path
 /// through).
-pub fn move_or_rename(config: &Config, from_path: &str, to_path: &str) -> Result<(), String> {
+pub fn move_or_rename(
+    config: &Config,
+    from_path: &str,
+    to_path: &str,
+) -> Result<Option<DeltaItem>, String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}",
         item_path_segment(&config.drive_base, from_path)
@@ -493,7 +658,9 @@ pub fn move_or_rename(config: &Config, from_path: &str, to_path: &str) -> Result
             String::from_utf8_lossy(&response.body)
         ));
     }
-    Ok(())
+    Ok(serde_json::from_slice::<DriveItem>(&response.body)
+        .ok()
+        .and_then(|item| to_delta_item(&item)))
 }
 
 #[cfg(test)]
@@ -582,5 +749,45 @@ mod tests {
             parent_reference_path("B087983F641B9ED3", "/Documents"),
             "/drives/B087983F641B9ED3/root:/Documents"
         );
+    }
+
+    #[test]
+    fn parses_delta_page_facets() {
+        let json = br#"{
+            "value": [
+                {"id":"root1","name":"root","root":{},"folder":{},"size":0,"eTag":"r","lastModifiedDateTime":"2026-01-12T08:30:00Z"},
+                {"id":"gone","deleted":{"state":"deleted"}},
+                {"id":"file1","name":"a.txt","size":3,"eTag":"e","parentReference":{"id":"root1"},"file":{},"lastModifiedDateTime":"2026-01-12T08:30:00Z"}
+            ],
+            "@odata.deltaLink":"https://graph.microsoft.com/v1.0/me/drive/root/delta?token=t"
+        }"#;
+        let page = parse_delta_page(json).unwrap();
+        assert_eq!(page.items.len(), 3);
+        assert!(page.items[0].is_root);
+        assert!(page.items[1].deleted);
+        assert_eq!(page.items[2].parent_id.as_deref(), Some("root1"));
+        assert_eq!(
+            page.delta_token.as_deref(),
+            Some("https://graph.microsoft.com/v1.0/me/drive/root/delta?token=t")
+        );
+    }
+
+    #[test]
+    fn delta_next_link_must_stay_on_graph() {
+        let json = br#"{
+            "value": [],
+            "@odata.nextLink":"https://evil.example/x"
+        }"#;
+        assert!(parse_delta_page(json).is_err());
+    }
+
+    #[test]
+    fn resync_required_is_detected() {
+        assert!(is_resync(410, b"{}"));
+        assert!(is_resync(
+            400,
+            br#"{"error":{"code":"resyncRequired","message":"go again"}}"#
+        ));
+        assert!(!is_resync(400, br#"{"error":{"code":"invalidRequest"}}"#));
     }
 }

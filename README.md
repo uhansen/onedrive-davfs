@@ -52,11 +52,17 @@ Implemented, against the real Microsoft Graph API:
   daemon only binds to loopback and that alone isn't treated as a
   sufficient trust boundary
 
+- A local **metadata index** served from `/state/index.bin`. `PROPFIND`
+  and `HEAD` read a segmented snapshot (directory table + per-folder
+  child blocks). Graph `/delta` keeps it fresh via an authenticated
+  `POST` with `X-OneDrive-Sync: 1`, driven by
+  `onedrive-davfs-sync.timer` every 30s. Local `PUT`/`MKCOL`/`DELETE`/`MOVE`
+  patch the snapshot immediately. `ONEDRIVE_INDEX_ENABLED=0` restores
+  live Graph listings. A miss or corrupt snapshot always falls back to
+  Graph, so a bad index cannot break the mount.
+
 Explicitly **not** implemented yet:
 
-- Chunked/resumable upload sessions for files above the simple-upload
-  ceiling (`PUT` above ~4 MiB returns `507` instead of silently failing)
-- Graph `/delta` change-feed polling, conflict resolution
 - A `/status` JSON endpoint or any integration with `onedrive-sync`
 - The interactive/first-consent OAuth flow (see below -- this is
   intentionally a separate native script, not part of the sandboxed
@@ -107,6 +113,10 @@ install -m 600 systemd/onedrive-davfs.env.example ~/.config/onedrive-davfs/env
 $EDITOR ~/.config/onedrive-davfs/env   # set ONEDRIVE_BASIC_AUTH_SECRET (openssl rand -base64 32), and ONEDRIVE_CLIENT_ID if the daemon must refresh
 systemctl --user daemon-reload
 systemctl --user enable --now onedrive-davfs.service
+cp systemd/onedrive-davfs-sync.service systemd/onedrive-davfs-sync.timer \
+  ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now onedrive-davfs-sync.timer
 ```
 
 > `wasmtime serve` does not inherit the host environment into the guest.
@@ -221,17 +231,23 @@ src/
   lib.rs          Guest impl for wasi:http/incoming-handler, request dispatch
   dav.rs          WebDAV verb handlers (PROPFIND/GET/PUT/MKCOL/DELETE/MOVE/LOCK)
   xml.rs          multistatus building, http_date, xml_escape, pct_encode
-  graph.rs        Microsoft Graph client (stat/children/get/put/create/delete/move)
+  graph.rs        Microsoft Graph client (stat/children/delta/get/put/create/delete/move)
+  index.rs        id-keyed namespace (nodes + child sets) used during /delta apply
+  snapshot.rs     segmented on-disk index.bin (seekable PROPFIND/HEAD)
+  sync.rs         POST /_sync: bounded /delta crawl + 410 shadow resync
   auth.rs         OAuth2 refresh-token handling
   config.rs       env var + preopened state-dir configuration
   http_client.rs  generic blocking HTTP client over wasi:http/outgoing-handler
   state_file.rs   read/write a file in the preopened state directory
 tools/
   device-code-login.sh   native, one-time OAuth device code bootstrap
+  sync-tick.sh           systemd timer helper: POST /_sync without secret-on-argv
 systemd/
   onedrive-davfs.service         the daemon (wasmtime serve)
   onedrive-davfs.env.example     template for ~/.config/onedrive-davfs/env (chmod 600)
   onedrive-davfs-mount.service   optional: davfs2 mount as its own unit
+  onedrive-davfs-sync.service    one-shot POST /_sync tick
+  onedrive-davfs-sync.timer      every 30s
 wit/
   world.wit       component world (wasi:http/proxy + filesystem/cli imports)
 ```

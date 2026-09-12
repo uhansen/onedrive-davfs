@@ -6,7 +6,10 @@ mod config;
 mod dav;
 mod graph;
 mod http_client;
+mod index;
+mod snapshot;
 mod state_file;
+mod sync;
 mod xml;
 
 use bindings::exports::wasi::http::incoming_handler::Guest;
@@ -295,6 +298,13 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
 
     if !check_basic_auth(&config, &headers) {
         return DavResponse::unauthorized();
+    }
+
+    if matches!(request.method(), Method::Post) {
+        if header_value(&headers, "x-onedrive-sync").as_deref() == Some("1") {
+            return sync::run(&config);
+        }
+        return DavResponse::error(405, "unsupported method: POST");
     }
 
     let path = match sanitize_path(&raw_path) {

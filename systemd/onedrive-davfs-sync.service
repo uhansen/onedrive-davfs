@@ -1,0 +1,20 @@
+# One-shot tick that asks the daemon to consume Graph /delta pages.
+#
+# The Basic-auth secret is fed to curl via a config file on stdin (`curl -K -`)
+# so it never appears on the process argv.
+#
+# Install:
+#   cp systemd/onedrive-davfs-sync.service systemd/onedrive-davfs-sync.timer \
+#     ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now onedrive-davfs-sync.timer
+
+[Unit]
+Description=onedrive-davfs metadata index sync tick
+After=onedrive-davfs.service
+Requires=onedrive-davfs.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/onedrive-davfs/env
+ExecStart=%h/.local/share/onedrive-davfs/sync-tick.sh
