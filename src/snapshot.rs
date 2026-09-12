@@ -8,7 +8,7 @@
 //!   meta JSON
 
 use crate::bindings::wasi::filesystem::types::Descriptor;
-use crate::index::{normalize_path, parent_path, Index, ItemMeta, Node};
+use crate::index::{Index, ItemMeta, Node, normalize_path, parent_path};
 use crate::state_file;
 use serde::{Deserialize, Serialize};
 
