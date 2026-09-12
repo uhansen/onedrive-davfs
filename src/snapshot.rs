@@ -159,11 +159,7 @@ pub fn decode(bytes: &[u8]) -> Result<Index, String> {
     };
 
     for row in &rows {
-        let children = parse_child_block(
-            bytes,
-            row.block_off,
-            row.block_len,
-        )?;
+        let children = parse_child_block(bytes, row.block_off, row.block_len)?;
         index.nodes.insert(
             row.id.clone(),
             Node {
@@ -197,7 +193,10 @@ pub fn decode(bytes: &[u8]) -> Result<Index, String> {
         index.kids.insert(row.id.clone(), set);
     }
 
-    let path_to_id: HashLite = rows.iter().map(|r| (r.path.clone(), r.id.clone())).collect();
+    let path_to_id: HashLite = rows
+        .iter()
+        .map(|r| (r.path.clone(), r.id.clone()))
+        .collect();
     for row in &rows {
         if row.path == "/" {
             index.nodes.entry(row.id.clone()).and_modify(|n| {
@@ -365,7 +364,9 @@ fn parse_header(bytes: &[u8]) -> Result<(u64, u32, u64, u32), String> {
     if dir_table_off as usize > bytes.len() || meta_off as usize > bytes.len() {
         // lookup_file passes a 32-byte header only; offsets may exceed that.
         // Bound-check against the slice only when the slice looks like a full file.
-        if bytes.len() != HEADER_LEN && (meta_off as usize > bytes.len() || dir_table_off as usize > bytes.len()) {
+        if bytes.len() != HEADER_LEN
+            && (meta_off as usize > bytes.len() || dir_table_off as usize > bytes.len())
+        {
             return Err("index offsets out of range".into());
         }
     }
@@ -377,7 +378,9 @@ fn parse_meta(bytes: &[u8], meta_off: u64, meta_len: u32) -> Result<SnapshotMeta
     let end = start
         .checked_add(meta_len as usize)
         .ok_or_else(|| "index meta overflow".to_string())?;
-    let slice = bytes.get(start..end).ok_or_else(|| "index meta truncated".to_string())?;
+    let slice = bytes
+        .get(start..end)
+        .ok_or_else(|| "index meta truncated".to_string())?;
     serde_json::from_slice(slice).map_err(|e| format!("index meta: {e}"))
 }
 
@@ -518,7 +521,9 @@ mod tests {
         let mut idx = Index {
             generation: 3,
             crawl_complete: true,
-            delta_token: Some("https://graph.microsoft.com/v1.0/me/drive/root/delta?token=abc".into()),
+            delta_token: Some(
+                "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=abc".into(),
+            ),
             ..Index::default()
         };
         idx.apply(root());

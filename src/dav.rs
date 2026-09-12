@@ -150,11 +150,7 @@ fn propfind_from_index(config: &Config, path: &str, depth: Option<&str>) -> Opti
         Lookup::Dir { info, children } => {
             let mut entries = vec![entry_from_info(path, &info, true)];
             if depth != Some("0") {
-                entries.extend(
-                    children
-                        .iter()
-                        .map(|c| entry_from_info(path, c, false)),
-                );
+                entries.extend(children.iter().map(|c| entry_from_info(path, c, false)));
             }
             entries
         }
@@ -262,7 +258,12 @@ fn write_through(config: &Config, f: impl FnOnce(&mut crate::index::Index) -> bo
     snapshot::mutate(&config.state_dir, f);
 }
 
-fn apply_or_upsert(idx: &mut crate::index::Index, item: Option<DeltaItem>, path: &str, meta: ItemMeta) -> bool {
+fn apply_or_upsert(
+    idx: &mut crate::index::Index,
+    item: Option<DeltaItem>,
+    path: &str,
+    meta: ItemMeta,
+) -> bool {
     if let Some(it) = item {
         idx.apply(it);
         if idx.resolve(path).is_some() {

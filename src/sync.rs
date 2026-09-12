@@ -91,8 +91,7 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
                         url = next;
                     }
                     None => {
-                        if idx.delta_token != page.delta_token || idx.pending_next_link.is_some()
-                        {
+                        if idx.delta_token != page.delta_token || idx.pending_next_link.is_some() {
                             dirty = true;
                         }
                         idx.pending_next_link = None;

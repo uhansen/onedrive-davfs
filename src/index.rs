@@ -3,7 +3,7 @@
 //! Graph delta items are keyed by item id. A move is a reparent; descendant
 //! paths are derived by walking parents, never stored.
 
-use std::collections::{HashMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 
 pub type Id = String;
 

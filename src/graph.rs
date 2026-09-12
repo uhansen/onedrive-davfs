@@ -290,8 +290,8 @@ pub fn delta(config: &Config, url: &str) -> Result<DeltaPage, DeltaError> {
             "delta url is not a graph.microsoft.com link".into(),
         ));
     };
-    let response = graph_request(config, Method::Get, &url, None, &[])
-        .map_err(DeltaError::Other)?;
+    let response =
+        graph_request(config, Method::Get, &url, None, &[]).map_err(DeltaError::Other)?;
     if is_resync(response.status, &response.body) {
         return Err(DeltaError::Resync);
     }
