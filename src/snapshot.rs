@@ -27,6 +27,13 @@ pub struct SnapshotMeta {
     pub generation: u64,
     pub built_at: u64,
     pub root_id: Option<String>,
+    /// Directory count (including root), baked in at encode time so
+    /// `/_status` can report tree size from a header+meta read alone.
+    /// Missing on snapshots written before this field existed.
+    #[serde(default)]
+    pub total_dirs: u64,
+    #[serde(default)]
+    pub total_files: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -120,13 +127,28 @@ pub fn encode(index: &Index) -> Result<Vec<u8>, String> {
         write_dir_row(&mut body, row);
     }
 
+    let mut total_files = 0u64;
+    for (id, _, _) in &dirs {
+        if let Some(set) = index.kids.get(*id) {
+            for (_, cid) in set {
+                if let Some(child) = index.nodes.get(cid) {
+                    if !child.meta.is_dir {
+                        total_files += 1;
+                    }
+                }
+            }
+        }
+    }
+
     let meta = SnapshotMeta {
         delta_token: index.delta_token.clone(),
         pending_next_link: index.pending_next_link.clone(),
         crawl_complete: index.crawl_complete,
         generation: index.generation,
-        built_at: 0,
+        built_at: now_secs(),
         root_id: index.root.clone(),
+        total_dirs: dirs.len() as u64,
+        total_files,
     };
     let meta_bytes = serde_json::to_vec(&meta).map_err(|e| e.to_string())?;
     let meta_off = body.len() as u64;
@@ -222,6 +244,38 @@ pub fn decode(bytes: &[u8]) -> Result<Index, String> {
 /// for the decode-only maps.
 type BTreeSetLite = std::collections::BTreeSet<(String, String)>;
 type HashLite = std::collections::HashMap<String, String>;
+
+fn now_secs() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::bindings::wasi::clocks::wall_clock::now().seconds
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+}
+
+/// Header + meta JSON only — no directory table or child blocks.
+pub fn read_meta(dir: &Descriptor) -> Result<Option<SnapshotMeta>, String> {
+    let header = match state_file::read_at(dir, INDEX_FILE, 0, HEADER_LEN as u64)? {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+    if header.len() < HEADER_LEN {
+        return Err("index header truncated".into());
+    }
+    let (_dir_table_off, _dir_count, meta_off, meta_len) = parse_header(&header)?;
+    let meta_bytes = match state_file::read_at(dir, INDEX_FILE, meta_off, meta_len as u64)? {
+        Some(b) => b,
+        None => return Err("index meta missing".into()),
+    };
+    let meta = serde_json::from_slice(&meta_bytes).map_err(|e| format!("index meta: {e}"))?;
+    Ok(Some(meta))
+}
 
 pub fn load(dir: &Descriptor, name: &str) -> Result<Option<Index>, String> {
     match state_file::read_file(dir, name)? {
@@ -561,6 +615,11 @@ mod tests {
         assert_eq!(out.delta_token, idx.delta_token);
         assert!(out.crawl_complete);
         assert_eq!(out.generation, 3);
+        let (_off, _count, meta_off, meta_len) = parse_header(&bytes).unwrap();
+        let meta = parse_meta(&bytes, meta_off, meta_len).unwrap();
+        assert_eq!(meta.total_dirs, 2);
+        assert_eq!(meta.total_files, 1);
+        assert!(meta.built_at > 0);
 
         let hit = lookup_bytes(&bytes, "/Docs").unwrap().unwrap();
         match hit {

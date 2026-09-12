@@ -60,10 +60,17 @@ Implemented, against the real Microsoft Graph API:
   patch the snapshot immediately. `ONEDRIVE_INDEX_ENABLED=0` restores
   live Graph listings. A miss or corrupt snapshot always falls back to
   Graph, so a bad index cannot break the mount.
+- Plugin JSON endpoints, gated on `GET` + `X-OneDrive-Plugin: 1` (davfs2
+  never sends this header, so OneDrive folders named `_status`/`_tree`
+  stay reachable as WebDAV):
+  - `GET /_status` -- index crawl progress, item counts, last `/_sync` tick
+  - `GET /_tree?path=/…` -- one directory of the index (Graph fallback on miss)
+
+These report **metadata-index** progress (items applied per tick), not
+file-transfer bandwidth: each `GET`/`PUT` is still a direct Graph call.
 
 Explicitly **not** implemented yet:
 
-- A `/status` JSON endpoint or any integration with `onedrive-sync`
 - The interactive/first-consent OAuth flow (see below -- this is
   intentionally a separate native script, not part of the sandboxed
   component)

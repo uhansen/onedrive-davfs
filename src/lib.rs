@@ -1,6 +1,7 @@
 #[allow(warnings)]
 mod bindings;
 
+mod api;
 mod auth;
 mod config;
 mod dav;
@@ -10,6 +11,7 @@ mod index;
 mod snapshot;
 mod state_file;
 mod sync;
+mod sync_stats;
 mod xml;
 
 use bindings::exports::wasi::http::incoming_handler::Guest;
@@ -141,7 +143,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Percent-decodes and sanity-checks a request path coming from the WebDAV
 /// client. Rejects `.`/`..` segments and control characters so nothing odd
 /// is ever forwarded into a Graph `root:/...:` address.
-fn sanitize_path(raw: &str) -> Result<String, String> {
+pub(crate) fn sanitize_path(raw: &str) -> Result<String, String> {
     let decoded = xml::pct_decode(raw).ok_or("malformed percent-encoding in path")?;
     if decoded.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err("control characters are not allowed in paths".to_string());
@@ -287,13 +289,11 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
         Err(e) => return DavResponse::error(500, format!("config error: {e}")),
     };
 
-    let raw_path = request
-        .path_with_query()
-        .unwrap_or_default()
-        .split('?')
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let full = request.path_with_query().unwrap_or_default();
+    let (raw_path, query) = match full.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (full, None),
+    };
     let headers = request.headers();
 
     if !check_basic_auth(&config, &headers) {
@@ -305,6 +305,16 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
             return sync::run(&config);
         }
         return DavResponse::error(405, "unsupported method: POST");
+    }
+
+    if matches!(request.method(), Method::Get)
+        && header_value(&headers, "x-onedrive-plugin").as_deref() == Some("1")
+    {
+        match raw_path.as_str() {
+            "/_status" | "_status" => return api::status(&config),
+            "/_tree" | "_tree" => return api::tree(&config, query.as_deref()),
+            _ => {}
+        }
     }
 
     let path = match sanitize_path(&raw_path) {
