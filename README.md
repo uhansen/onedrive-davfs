@@ -61,10 +61,17 @@ Implemented, against the real Microsoft Graph API:
   live Graph listings. A miss or corrupt snapshot always falls back to
   Graph, so a bad index cannot break the mount.
 - Plugin JSON endpoints, gated on `GET` + `X-OneDrive-Plugin: 1` (davfs2
-  never sends this header, so OneDrive folders named `_status`/`_tree`
+  never sends this header, so OneDrive folders named `_status`/`_tree`/`_search`
   stay reachable as WebDAV):
   - `GET /_status` -- index crawl progress, item counts, last `/_sync` tick
   - `GET /_tree?path=/…` -- one directory of the index (Graph fallback on miss)
+  - `GET /_search?q=<term>` -- case-insensitive substring search over the
+    index by name, files **and** folders (unlike `/_tree`, which is
+    folders-only). Read-only, served entirely from the local snapshot — no
+    Graph call. Returns `{"ok":true,"ready":false}` if the index isn't
+    enabled or hasn't crawled yet; `q` shorter than 2 characters returns an
+    empty result set; results are capped (100) with `"truncated":true` if
+    the cap was hit, directories sorted first, then by path.
 
 These report **metadata-index** progress (items applied per tick), not
 file-transfer bandwidth: each `GET`/`PUT` is still a direct Graph call.

@@ -62,6 +62,78 @@ pub fn status(config: &Config) -> DavResponse {
     json_ok(body)
 }
 
+const SEARCH_MAX_RESULTS: usize = 100;
+const SEARCH_MIN_QUERY_LEN: usize = 2;
+
+pub fn search(config: &Config, query: Option<&str>) -> DavResponse {
+    let q = query_param(query, "q").unwrap_or_default();
+
+    if !config.index_enabled {
+        return json_ok(serde_json::json!({"ok": true, "ready": false}));
+    }
+
+    let index = match snapshot::load(&config.state_dir, snapshot::INDEX_FILE) {
+        Ok(Some(idx)) => idx,
+        Ok(None) => return json_ok(serde_json::json!({"ok": true, "ready": false})),
+        Err(_) => return json_ok(serde_json::json!({"ok": true, "ready": false})),
+    };
+
+    json_ok(search_index(&index, &q))
+}
+
+/// Pure name-substring search over an already-loaded index. Split out from
+/// `search` so it's testable without a WASI `Config`/`Descriptor`.
+fn search_index(index: &index::Index, q: &str) -> serde_json::Value {
+    if q.chars().count() < SEARCH_MIN_QUERY_LEN {
+        return serde_json::json!({
+            "ok": true,
+            "ready": true,
+            "query": q,
+            "truncated": false,
+            "results": [],
+        });
+    }
+
+    let needle = q.to_lowercase();
+    let mut matches: Vec<(String, &index::Node)> = index
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.parent.is_some() && node.name.to_lowercase().contains(&needle))
+        .filter_map(|(id, node)| index.path_of(id).map(|path| (path, node)))
+        .collect();
+
+    matches.sort_by(|(pa, na), (pb, nb)| {
+        nb.meta
+            .is_dir
+            .cmp(&na.meta.is_dir)
+            .then_with(|| pa.cmp(pb))
+    });
+
+    let truncated = matches.len() > SEARCH_MAX_RESULTS;
+    matches.truncate(SEARCH_MAX_RESULTS);
+
+    let results: Vec<serde_json::Value> = matches
+        .into_iter()
+        .map(|(path, node)| {
+            serde_json::json!({
+                "path": path,
+                "name": node.name,
+                "isDir": node.meta.is_dir,
+                "size": node.meta.size,
+                "mtime": node.meta.mtime,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "ok": true,
+        "ready": true,
+        "query": q,
+        "truncated": truncated,
+        "results": results,
+    })
+}
+
 pub fn tree(config: &Config, query: Option<&str>) -> DavResponse {
     let raw = query_param(query, "path").unwrap_or_else(|| "/".to_string());
     let path = match crate::sanitize_path(&raw) {
@@ -243,5 +315,107 @@ mod tests {
     fn join_child_path_normalizes_root() {
         assert_eq!(join_child_path("/", "a"), "/a");
         assert_eq!(join_child_path("/Docs", "a.txt"), "/Docs/a.txt");
+    }
+
+    fn item(id: &str, parent: &str, name: &str, is_dir: bool) -> index::DeltaItem {
+        index::DeltaItem {
+            id: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            name: name.to_string(),
+            deleted: false,
+            is_root: false,
+            meta: index::ItemMeta {
+                is_dir,
+                size: if is_dir { 0 } else { 42 },
+                mtime: 1234,
+                etag: "etag".to_string(),
+            },
+        }
+    }
+
+    fn root(id: &str) -> index::DeltaItem {
+        index::DeltaItem {
+            id: id.to_string(),
+            parent_id: None,
+            name: String::new(),
+            deleted: false,
+            is_root: true,
+            meta: index::ItemMeta {
+                is_dir: true,
+                size: 0,
+                mtime: 0,
+                etag: String::new(),
+            },
+        }
+    }
+
+    fn sample_index() -> index::Index {
+        let mut idx = index::Index::default();
+        idx.apply(root("r"));
+        idx.apply(item("docs", "r", "Documents", true));
+        idx.apply(item("f1", "docs", "Report.docx", false));
+        idx.apply(item("f2", "r", "report-summary.txt", false));
+        idx.apply(item("f3", "r", "other.txt", false));
+        idx
+    }
+
+    #[test]
+    fn search_index_requires_min_query_length() {
+        let idx = sample_index();
+        let out = search_index(&idx, "r");
+        assert_eq!(out["ready"], serde_json::json!(true));
+        assert_eq!(out["results"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn search_index_is_case_insensitive_substring_over_files_and_folders() {
+        let idx = sample_index();
+        let out = search_index(&idx, "REPORT");
+        let results = out["results"].as_array().unwrap();
+        let names: Vec<&str> = results
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"Report.docx"));
+        assert!(names.contains(&"report-summary.txt"));
+        assert!(!names.contains(&"other.txt"));
+    }
+
+    #[test]
+    fn search_index_derives_correct_paths_via_parent_walk() {
+        let idx = sample_index();
+        let out = search_index(&idx, "Report.docx");
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["path"], serde_json::json!("/Documents/Report.docx"));
+        assert_eq!(results[0]["isDir"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn search_index_sorts_directories_first_then_by_path() {
+        let idx = sample_index();
+        let out = search_index(&idx, "do");
+        let results = out["results"].as_array().unwrap();
+        // "Documents" (dir) should sort before any file matches.
+        assert_eq!(results[0]["isDir"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn search_index_truncates_and_flags_when_over_cap() {
+        let mut idx = index::Index::default();
+        idx.apply(root("r"));
+        for i in 0..(SEARCH_MAX_RESULTS + 5) {
+            idx.apply(item(&format!("f{i}"), "r", &format!("match-{i}.txt"), false));
+        }
+        let out = search_index(&idx, "match");
+        assert_eq!(out["truncated"], serde_json::json!(true));
+        assert_eq!(out["results"].as_array().unwrap().len(), SEARCH_MAX_RESULTS);
+    }
+
+    #[test]
+    fn search_index_not_truncated_when_under_cap() {
+        let idx = sample_index();
+        let out = search_index(&idx, "report");
+        assert_eq!(out["truncated"], serde_json::json!(false));
     }
 }

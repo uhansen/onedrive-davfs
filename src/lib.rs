@@ -313,6 +313,7 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
         match raw_path.as_str() {
             "/_status" | "_status" => return api::status(&config),
             "/_tree" | "_tree" => return api::tree(&config, query.as_deref()),
+            "/_search" | "_search" => return api::search(&config, query.as_deref()),
             _ => {}
         }
     }
