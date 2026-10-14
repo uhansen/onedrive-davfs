@@ -5,8 +5,7 @@ component (`wasm32-wasip2`) and served by a dedicated native Rust host built
 on Wasmtime. It exists as a capability-sandboxed alternative to `rclone mount`
 for syncing OneDrive on Linux, and is the intended eventual backend for the
 [`onedrive-sync`](https://github.com/uhansen/onedrive-sync) Omarchy plugin
-(that integration is a separate, later piece of work -- see "Non-goals"
-below).
+(the plugin also supports the existing single-library configuration).
 
 In normal use the host runs as a `systemd --user` daemon and is enabled for
 startup/login with `systemctl --user enable onedrive-davfs.service`.
@@ -40,13 +39,13 @@ No OAuth tokens or raw network I/O ever cross a trust boundary that isn't
 `wasi:http` itself; there is no ambient filesystem or socket access beyond
 what's explicitly granted by the native host.
 
-## Scope of this first pass
+## Backend capabilities
 
 Implemented, against the real Microsoft Graph API:
 
 - `PROPFIND` (Depth 0/1; `Depth: infinity` is refused with `403` +
   `propfind-finite-depth` per RFC 4918)
-- `GET`, `PUT` (direct/simple upload only, up to Graph's ~4 MiB ceiling)
+- `GET`, `PUT` (buffered, up to 64 MiB; uploads above 4 MiB use sessions)
 - `MKCOL`, `DELETE`, `MOVE`
 - `LOCK`/`UNLOCK` (fixed no-op success responses -- enough to satisfy
   davfs2's locking requirement for a single-writer mount; Graph has no
@@ -82,15 +81,17 @@ Implemented, against the real Microsoft Graph API:
     `groupId=<id>` scopes to one Microsoft 365 group; `siteId=<id>` scopes to
     one SharePoint site; `siteUrl=<https://tenant.sharepoint.com/sites/...>`
     resolves that site first, then lists its libraries.
+  - `GET /_resolve?selector=...` -- verifies a proposed selector and returns
+    canonical account/drive metadata for native profile setup. It does not
+    change the running library or its index.
 
 These report **metadata-index** progress (items applied per tick), not
 file-transfer bandwidth: each `GET`/`PUT` is still a direct Graph call.
 
-Explicitly **not** implemented yet:
+Intentionally **outside the WebAssembly component**:
 
-- The interactive/first-consent OAuth flow (see below -- this is
-  intentionally a separate native script, not part of the sandboxed
-  component)
+- Interactive/first-consent OAuth runs in the native browser/PKCE or
+  device-code helper (see below), not inside the sandboxed component.
 
 ## OAuth setup
 
@@ -105,6 +106,9 @@ Explicitly **not** implemented yet:
    `https://login.microsoftonline.com/common/oauth2/nativeclient`, and
    enable "Allow public client flows" (required for the device code
    flow used below).
+   For browser/PKCE sign-in, also register `http://localhost/callback`.
+   The helper chooses an ephemeral port; Entra ignores the port for registered
+   localhost native-client redirects but still matches the callback path.
 4. Under API permissions, add delegated Microsoft Graph scopes:
    `Files.ReadWrite.All`, `offline_access`, `User.Read`.
    Add `Sites.Read.All` only if you want scoped SharePoint site discovery.
@@ -170,10 +174,58 @@ account's primary drive. You can also set it to:
 - `groups/<group-id>/drive`
 - `sites/<site-id>/drive`
 
-The daemon canonicalizes that selector and binds the persisted local index to
-the resolved drive identity. Switching the selector or signed-in account in an
-existing state directory forces a fresh crawl instead of reusing stale delta
-links or search metadata from the previous drive.
+The daemon binds its index to verified account ID, login-session ID, client,
+tenant, selector, and resolved drive ID. Changing account/login or configuration
+immediately gates cached reads until successful verification and a new crawl;
+failed verification preserves the old snapshot without exposing it under the
+new binding. Display-name changes do not force a recrawl. `accessVerified`
+means the current binding was verified when its snapshot was published, not
+that a token file guarantees continuing tenant access. Polling does not call
+Graph to reconfirm permissions.
+
+## Multiple accounts and Microsoft 365 libraries
+
+Commercial personal/work accounts, multiple tenants, explicit SharePoint
+libraries, and accessible Teams/channel backing sites use the same drive APIs.
+Government/China authorities are not supported. This implementation is
+**fixture-tested, not organizational-account certified**.
+
+Native `tools/profiles.py` maintains a version-1 account/library registry.
+Each account owns a private credential directory; each library owns a separate
+state directory, loopback endpoint, mountpoint, daemon, mount unit, and timer.
+Pass the account directory to the native host using `--account-dir`: a shared
+cross-process lock and atomic credential handoff prevent refresh-token races.
+Interrupted handoffs are recovered before another request or login. Requests
+sharing an account serialize while holding this lease; slow requests can delay
+other libraries' Graph operations. While that work is running, authenticated
+status, search and indexed-tree requests use two separate bounded read slots:
+their guest state is read-only, outbound HTTP is denied, and no credential
+lease is acquired. If the shared login and library credential copy differ,
+these reads return an explicit retry error rather than exposing stale state.
+Unindexed folders return an indexing/retry message while a sync is busy;
+normal idle browsing retains its Graph fallback. Bare reachability probes
+also bypass the busy writer, but authentication is still checked by the guest.
+The guest sees only `/state`, never the shared account store.
+The original single-library units and token location remain supported.
+
+See [the multi-profile walkthrough](INSTALL.md#multiple-accountslibraries)
+for bootstrap, generated units, startup and migration. Profile setup only
+publishes configuration; it never installs units, edits fstab, or starts mounts.
+An existing registry/library is not switched in place when verification fails.
+The frontend can use this registry for unified browsing/search and scoped
+discovery. Blank scope lists `/me/drives`; `group:<id>`, `site:<id>`, and
+`siteUrl:https://tenant.sharepoint.com/sites/...` discover only the supplied
+scope. Private/shared Teams channels may need their own explicit site.
+Discovery is bounded to 10 pages/1,000 libraries; there is no tenant-wide scan.
+
+Keep login and refresh scopes identical. `Sites.Read.All` is optional and only
+needed for endpoints requiring site lookup/consent; changing scopes requires
+interactive consent again. Admin consent, user permissions, conditional access,
+and compliant-device/broker requirements can still prevent access. The helpers
+do not bypass these policies. Diagnostics classify Graph 401/403/404 and claims
+challenges without printing token payloads or upstream error descriptions.
+Safe Graph reads retry 429/503 twice, respecting numeric or IMF-fixdate
+`Retry-After`; delays over 10 seconds are deferred explicitly, not shortened.
 
 ### 4. Mount with davfs2
 
@@ -214,6 +266,16 @@ wasm-tools validate target/wasm32-wasip2/release/onedrive_davfs.wasm
 ```sh
 cargo test --lib     # unit tests: date formatting, XML escaping, multistatus shape
 cargo test --manifest-path host/Cargo.toml
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools -p 'test_*.py'
+```
+
+After building both release artifacts, run the entirely offline multi-host
+integration fixture (no Microsoft credentials or network requests):
+
+```sh
+ONEDRIVE_TEST_HOST="$PWD/host/target/release/onedrive-davfs-host" \
+ONEDRIVE_TEST_COMPONENT="$PWD/target/wasm32-wasip2/release/onedrive_davfs.wasm" \
+python3 -m unittest discover -s tools -p 'test_host_component.py'
 ```
 
 Manual smoke test once a token is in place (the daemon refuses to start
@@ -265,14 +327,16 @@ curl -u "daemon:$SECRET" -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8765/
   are treated the same way.
 - **Guest capabilities are explicit.** The host forwards only the documented
   OneDrive env vars, preopens only `/state`, keeps guest socket/name-lookup
-  APIs disabled, serializes guest invocations with a bounded queue, and
-  applies store limits and epoch interruption.
+  APIs disabled, serializes state-changing/Graph invocations with a bounded
+  queue, and applies store limits and epoch interruption. Two additional
+  read-only, network-denied stores keep cached UI requests responsive during
+  long sync ticks without allowing concurrent credential or snapshot writes.
 - **No token logging.** The component emits no log lines; Graph error
   bodies are relayed to the client as `502` text but never include the
   `Authorization` header or token endpoint payloads.
 - Request bodies are only read for `PUT` (`PROPFIND`/`LOCK` bodies are
   ignored, so there is no XML parsing surface). `PUT` is buffered up to
-  64 MiB; files above Graph's 4 MiB simple-upload ceiling use a
+  64 MiB; files above this implementation's 4 MiB simple-upload threshold use a
   `createUploadSession` with chunked `Content-Range` PUTs.
 - **Large downloads still buffer inside the guest.** The current WebDAV `GET`
   path still materializes the full Graph response body in guest memory before
@@ -312,9 +376,9 @@ wit/
 
 ## Non-goals for this repo (currently)
 
-- No changes to the `onedrive-sync` Omarchy plugin. That plugin currently
-  talks to `rclone mount`; teaching it to talk to this daemon instead (or
-  in addition) is a deliberate follow-up, not part of this repo's scope.
+- Frontend UI code remains in the separate `onedrive-sync` repository.
+  OAuth tokens stay in native/guest code, never in the frontend.
+- This is not Office desktop coauthoring or a full offline sync client.
 
 ## License
 

@@ -10,6 +10,12 @@ pub type Id = String;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriveBinding {
+    #[serde(default)]
+    pub account_id: String,
+    #[serde(default)]
+    pub credential_id: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
     pub tenant_id: String,
     pub drive_base: String,
     pub drive_id: String,
@@ -21,6 +27,32 @@ pub struct DriveBinding {
     pub web_url: String,
     #[serde(default)]
     pub owner_label: String,
+}
+
+impl DriveBinding {
+    pub fn same_target(&self, other: &Self) -> bool {
+        self.account_id == other.account_id
+            && self.credential_id == other.credential_id
+            && self.client_id == other.client_id
+            && self.tenant_id == other.tenant_id
+            && self.drive_base == other.drive_base
+            && self.drive_id == other.drive_id
+    }
+
+    pub fn matches_configuration(
+        &self,
+        tenant_id: &str,
+        client_id: Option<&str>,
+        drive_base: &str,
+        credential_id: Option<&str>,
+    ) -> bool {
+        !self.account_id.is_empty()
+            && !self.credential_id.is_empty()
+            && self.tenant_id == tenant_id
+            && self.client_id.as_deref() == client_id
+            && self.drive_base == drive_base
+            && Some(self.credential_id.as_str()) == credential_id
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -321,6 +353,59 @@ pub fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_binding_rejects_account_client_tenant_selector_and_login_changes() {
+        let binding = DriveBinding {
+            account_id: "account-a".into(),
+            credential_id: "login-a".into(),
+            client_id: Some("client-a".into()),
+            tenant_id: "tenant-a".into(),
+            drive_base: "drives/b!library-a".into(),
+            drive_id: "b!library-a".into(),
+            ..DriveBinding::default()
+        };
+        assert!(binding.matches_configuration(
+            "tenant-a",
+            Some("client-a"),
+            "drives/b!library-a",
+            Some("login-a")
+        ));
+        for (tenant, client, selector, credential) in [
+            (
+                "tenant-b",
+                Some("client-a"),
+                "drives/b!library-a",
+                Some("login-a"),
+            ),
+            (
+                "tenant-a",
+                Some("client-b"),
+                "drives/b!library-a",
+                Some("login-a"),
+            ),
+            (
+                "tenant-a",
+                Some("client-a"),
+                "drives/b!library-b",
+                Some("login-a"),
+            ),
+            (
+                "tenant-a",
+                Some("client-a"),
+                "drives/b!library-a",
+                Some("login-b"),
+            ),
+            ("tenant-a", Some("client-a"), "drives/b!library-a", None),
+        ] {
+            assert!(!binding.matches_configuration(tenant, client, selector, credential));
+        }
+        let mut renamed = binding.clone();
+        renamed.drive_name = "New name".into();
+        assert!(binding.same_target(&renamed));
+        renamed.account_id = "account-b".into();
+        assert!(!binding.same_target(&renamed));
+    }
 
     fn file(id: &str, parent: &str, name: &str) -> DeltaItem {
         DeltaItem {

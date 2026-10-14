@@ -12,35 +12,69 @@ use crate::sync_stats;
 use crate::xml;
 
 pub fn status(config: &Config) -> DavResponse {
+    let (credential_present, token_expires_in) = match crate::auth::credential_status(config) {
+        Ok(status) => status,
+        Err(error) => return json_ok(serde_json::json!({"ok": false, "error": error})),
+    };
+    let failure = match sync_stats::load_failure(config) {
+        Ok(failure) => failure,
+        Err(error) => return json_ok(serde_json::json!({"ok": false, "error": error})),
+    };
     if !config.index_enabled {
         return json_ok(serde_json::json!({
             "ok": true,
             "indexEnabled": false,
+            "credentialPresent": credential_present,
+            "tokenExpiresInSec": token_expires_in,
+            "lastSyncError": failure.as_ref().map(|failure| &failure.error),
+            "lastSyncErrorAt": failure.as_ref().map(|failure| failure.at),
+        }));
+    }
+    let meta = match snapshot::read_meta(&config.state_dir) {
+        Ok(meta) => meta,
+        Err(error) => return json_ok(serde_json::json!({"ok": false, "error": error})),
+    };
+    if !config.cache_current() {
+        return json_ok(serde_json::json!({
+            "ok": true,
+            "indexEnabled": true,
+            "present": false,
+            "accessVerified": false,
+            "reindexRequired": true,
+            "crawlComplete": false,
+            "credentialPresent": credential_present,
+            "tokenExpiresInSec": token_expires_in,
+            "lastSyncError": failure.as_ref().map(|failure| &failure.error),
+            "lastSyncErrorAt": failure.as_ref().map(|failure| failure.at),
         }));
     }
 
-    let meta = match snapshot::read_meta(&config.state_dir) {
-        Ok(m) => m,
-        Err(e) => {
-            return json_ok(serde_json::json!({
-                "ok": true,
-                "indexEnabled": true,
-                "error": e,
-            }));
-        }
-    };
     let last_tick = match sync_stats::load(&config.state_dir) {
-        Ok(s) => s,
-        Err(_) => None,
+        Ok(tick) => tick.filter(|tick| {
+            meta.as_ref()
+                .and_then(|meta| meta.binding.as_ref())
+                .is_some_and(|binding| tick.matches_binding(binding))
+        }),
+        Err(error) => return json_ok(serde_json::json!({"ok": false, "error": error})),
     };
+    let rebuilding = last_tick
+        .as_ref()
+        .is_some_and(|tick| tick.target == snapshot::REBUILD_FILE && !tick.complete);
 
     let mut body = serde_json::json!({
         "ok": true,
         "indexEnabled": true,
         "present": meta.is_some(),
+        "accessVerified": true,
+        "reindexRequired": false,
+        "rebuildInProgress": rebuilding,
+        "credentialPresent": credential_present,
+        "tokenExpiresInSec": token_expires_in,
+        "lastSyncError": failure.as_ref().map(|failure| &failure.error),
+        "lastSyncErrorAt": failure.as_ref().map(|failure| failure.at),
     });
     if let Some(meta) = meta {
-        body["crawlComplete"] = serde_json::json!(meta.crawl_complete);
+        body["crawlComplete"] = serde_json::json!(meta.crawl_complete && !rebuilding);
         body["hasToken"] = serde_json::json!(meta.delta_token.is_some());
         body["generation"] = serde_json::json!(meta.generation);
         body["builtAt"] = serde_json::json!(meta.built_at);
@@ -150,13 +184,38 @@ pub fn libraries(config: &Config, query: Option<&str>) -> DavResponse {
     }
 }
 
+pub fn resolve(config: &Config, query: Option<&str>) -> DavResponse {
+    let raw = query_param(query, "selector").unwrap_or_default();
+    let selector = match crate::config::normalize_drive_base(&raw) {
+        Ok(selector) => selector,
+        Err(error) => return DavResponse::error(400, error),
+    };
+    match graph::resolve_drive(config, &selector) {
+        Ok(binding) => json_ok(serde_json::json!({
+            "ok": true,
+            "drive": {
+                "accountId": binding.account_id,
+                "credentialId": binding.credential_id,
+                "tenantId": binding.tenant_id,
+                "selector": format!("drives/{}", binding.drive_id),
+                "id": binding.drive_id,
+                "name": binding.drive_name,
+                "type": binding.drive_type,
+                "webUrl": binding.web_url,
+                "owner": binding.owner_label,
+            }
+        })),
+        Err(error) => DavResponse::error(502, error),
+    }
+}
+
 const SEARCH_MAX_RESULTS: usize = 100;
 const SEARCH_MIN_QUERY_LEN: usize = 2;
 
 pub fn search(config: &Config, query: Option<&str>) -> DavResponse {
     let q = query_param(query, "q").unwrap_or_default();
 
-    if !config.index_enabled {
+    if !config.cache_current() {
         return json_ok(serde_json::json!({"ok": true, "ready": false}));
     }
 
@@ -218,19 +277,26 @@ fn search_index(index: &index::Index, q: &str) -> serde_json::Value {
     })
 }
 
-pub fn tree(config: &Config, query: Option<&str>) -> DavResponse {
+pub fn tree(config: &Config, query: Option<&str>, cache_only: bool) -> DavResponse {
     let raw = query_param(query, "path").unwrap_or_else(|| "/".to_string());
-    let path = match crate::sanitize_path(&raw) {
+    let path = match crate::sanitize_decoded_path(&raw) {
         Ok(p) => p,
         Err(e) => return DavResponse::error(400, e),
     };
 
-    if config.index_enabled {
+    if config.cache_current() {
         match snapshot::lookup_file(&config.state_dir, &path) {
             Ok(Some(hit)) => return json_ok(lookup_to_tree(&path, hit, "index")),
             Ok(None) => {}
-            Err(_) => {}
+            Err(error) => return DavResponse::error(502, error),
         }
+    }
+
+    if cache_only {
+        return json_ok(serde_json::json!({
+            "ok": false,
+            "error": "Library index is updating; retry browsing when this folder is indexed",
+        }));
     }
 
     match graph_tree(config, &path) {
@@ -380,6 +446,17 @@ fn json_ok(value: serde_json::Value) -> DavResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_query_paths_are_decoded_once_and_keep_sharepoint_percent_names() {
+        let decoded = query_param(Some("path=%2F100%25%20complete"), "path").unwrap();
+        assert_eq!(
+            crate::sanitize_decoded_path(&decoded).unwrap(),
+            "/100% complete"
+        );
+        let traversal = query_param(Some("path=%2F%2e%2e%2Fsecret"), "path").unwrap();
+        assert!(crate::sanitize_decoded_path(&traversal).is_err());
+    }
 
     #[test]
     fn query_param_reads_path() {

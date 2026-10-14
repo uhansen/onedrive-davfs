@@ -29,6 +29,8 @@ use wasmtime_wasi_http::{
     WasiHttpView,
 };
 
+mod credentials;
+
 const DEFAULT_ADDR: &str = "127.0.0.1:8765";
 const QUEUE_LIMIT: usize = 8;
 const FIELD_SIZE_LIMIT: usize = 64 * 1024;
@@ -58,6 +60,7 @@ const GUEST_ENV_NAMES: &[&str] = &[
 struct HostConfig {
     component_path: PathBuf,
     state_dir: PathBuf,
+    account_dir: Option<PathBuf>,
     listen_addr: SocketAddr,
 }
 
@@ -65,6 +68,7 @@ impl HostConfig {
     fn parse() -> Result<Self> {
         let mut component_path = None;
         let mut state_dir = None;
+        let mut account_dir = None;
         let mut listen_addr = DEFAULT_ADDR.parse::<SocketAddr>().unwrap();
 
         let mut args = std::env::args().skip(1);
@@ -82,6 +86,12 @@ impl HostConfig {
                         .ok_or_else(|| anyhow!("missing value for --state-dir"))?;
                     state_dir = Some(PathBuf::from(value));
                 }
+                "--account-dir" => {
+                    account_dir = Some(PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| anyhow!("missing value for --account-dir"))?,
+                    ));
+                }
                 "--addr" => {
                     let value = args
                         .next()
@@ -92,7 +102,7 @@ impl HostConfig {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "Usage: onedrive-davfs-host --component <path> --state-dir <path> [--addr {DEFAULT_ADDR}]"
+                        "Usage: onedrive-davfs-host --component <path> --state-dir <path> [--account-dir <path>] [--addr {DEFAULT_ADDR}]"
                     );
                     std::process::exit(0);
                 }
@@ -115,10 +125,21 @@ impl HostConfig {
                 state_dir.display()
             );
         }
+        let state_dir = state_dir.canonicalize()?;
+        let account_dir = account_dir.map(|path| path.canonicalize()).transpose()?;
+        if let Some(account_dir) = account_dir.as_ref() {
+            if !account_dir.is_dir()
+                || account_dir.starts_with(&state_dir)
+                || state_dir.starts_with(account_dir)
+            {
+                bail!("--account-dir must be separate from and not nested in per-library state");
+            }
+        }
 
         Ok(Self {
             component_path,
             state_dir,
+            account_dir,
             listen_addr,
         })
     }
@@ -233,11 +254,15 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
 #[derive(Clone, Debug)]
 struct HttpPolicyHooks {
     policy: OutboundPolicy,
+    read_only: bool,
 }
 
 impl HttpPolicyHooks {
     fn new(policy: OutboundPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            read_only: false,
+        }
     }
 }
 
@@ -263,6 +288,7 @@ impl WasiHttpHooks for HttpPolicyHooks {
             > + Send,
     > {
         let policy = self.policy.clone();
+        let read_only = self.read_only;
         let effective_options = RequestOptions {
             connect_timeout: options
                 .and_then(|o| o.connect_timeout)
@@ -276,6 +302,9 @@ impl WasiHttpHooks for HttpPolicyHooks {
         };
         _ = fut;
         Box::new(async move {
+            if read_only {
+                return Err(WasiHttpError::HttpRequestDenied);
+            }
             let (response, io) =
                 send_restricted_request(policy, request, effective_options).await?;
             Ok((
@@ -492,6 +521,36 @@ struct RequestAdmission {
     permit: OwnedSemaphorePermit,
 }
 
+struct QueueWaiter<'a>(&'a AtomicUsize);
+
+impl Drop for QueueWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn acquire_execution_slot(
+    execution_slot: &Arc<Semaphore>,
+    queued_waiters: &AtomicUsize,
+) -> Result<RequestAdmission> {
+    match execution_slot.clone().try_acquire_owned() {
+        Ok(permit) => Ok(RequestAdmission { permit }),
+        Err(_) => {
+            let queued = queued_waiters.fetch_add(1, Ordering::AcqRel) + 1;
+            let _waiter = QueueWaiter(queued_waiters);
+            if queued > QUEUE_LIMIT {
+                bail!("request queue full");
+            }
+            let permit = execution_slot
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("execution semaphore closed"))?;
+            Ok(RequestAdmission { permit })
+        }
+    }
+}
+
 impl RequestAdmission {
     fn into_permit(self) -> OwnedSemaphorePermit {
         self.permit
@@ -504,6 +563,7 @@ struct HostServer {
     config: HostConfig,
     guest_env: GuestEnv,
     execution_slot: Arc<Semaphore>,
+    read_slots: Arc<Semaphore>,
     queued_waiters: AtomicUsize,
 }
 
@@ -520,44 +580,36 @@ impl HostServer {
             config,
             guest_env,
             execution_slot: Arc::new(Semaphore::new(1)),
+            read_slots: Arc::new(Semaphore::new(2)),
             queued_waiters: AtomicUsize::new(0),
         }
     }
 
     async fn admit(&self) -> Result<RequestAdmission> {
-        match self.execution_slot.clone().try_acquire_owned() {
-            Ok(permit) => Ok(RequestAdmission { permit }),
-            Err(_) => {
-                let queued = self.queued_waiters.fetch_add(1, Ordering::AcqRel) + 1;
-                if queued > QUEUE_LIMIT {
-                    self.queued_waiters.fetch_sub(1, Ordering::AcqRel);
-                    bail!("request queue full");
-                }
-                let permit = self
-                    .execution_slot
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| anyhow!("execution semaphore closed"))?;
-                self.queued_waiters.fetch_sub(1, Ordering::AcqRel);
-                Ok(RequestAdmission { permit })
-            }
-        }
+        acquire_execution_slot(&self.execution_slot, &self.queued_waiters).await
     }
 
-    fn build_store(&self) -> Result<Store<HostState>> {
+    fn build_store(&self, read_only: bool) -> Result<Store<HostState>> {
         let mut wasi = WasiCtxBuilder::new();
         wasi.allow_blocking_current_thread(true);
         for (name, value) in self.guest_env.entries.iter() {
             wasi.env(name, value);
         }
-        wasi.preopened_dir(&self.config.state_dir, "/state", FsPerms::ReadWrite)
-            .map_err(|e| {
-                anyhow!(
-                    "failed to preopen state dir {}: {e}",
-                    self.config.state_dir.display()
-                )
-            })?;
+        wasi.preopened_dir(
+            &self.config.state_dir,
+            "/state",
+            if read_only {
+                FsPerms::ReadOnly
+            } else {
+                FsPerms::ReadWrite
+            },
+        )
+        .map_err(|e| {
+            anyhow!(
+                "failed to preopen state dir {}: {e}",
+                self.config.state_dir.display()
+            )
+        })?;
 
         let mut http = WasiHttpCtx::new();
         http.set_field_size_limit(FIELD_SIZE_LIMIT);
@@ -571,11 +623,13 @@ impl HostServer {
             .trap_on_grow_failure(true)
             .build();
 
+        let mut hooks = HttpPolicyHooks::new(OutboundPolicy);
+        hooks.read_only = read_only;
         let state = HostState {
             table: ResourceTable::new(),
             wasi: wasi.build(),
             http,
-            hooks: HttpPolicyHooks::new(OutboundPolicy),
+            hooks,
             limits,
         };
 
@@ -588,9 +642,38 @@ impl HostServer {
 
     async fn handle_request(
         self: Arc<Self>,
-        req: Request<Incoming>,
+        mut req: Request<Incoming>,
     ) -> Result<Response<HyperOutgoingBody>> {
-        let admission = match self.admit().await {
+        req.headers_mut().remove("x-onedrive-cache-only");
+        let read_candidate = is_local_read(&req);
+        let (admission, read_only) = if read_candidate {
+            match self.execution_slot.clone().try_acquire_owned() {
+                Ok(permit) => (Ok(RequestAdmission { permit }), false),
+                Err(_) => {
+                    if req.headers().contains_key("authorization")
+                        && !credentials::mirror_current(
+                            &self.config.state_dir,
+                            self.config.account_dir.as_deref(),
+                        )?
+                    {
+                        return Ok(plain_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "account credentials are changing; retry the request",
+                        ));
+                    }
+                    let admission = self
+                        .read_slots
+                        .clone()
+                        .try_acquire_owned()
+                        .map(|permit| RequestAdmission { permit })
+                        .map_err(|_| anyhow!("read request slots full"));
+                    (admission, true)
+                }
+            }
+        } else {
+            (self.admit().await, false)
+        };
+        let admission = match admission {
             Ok(admission) => admission,
             Err(_) => {
                 return Ok(plain_response(
@@ -600,7 +683,20 @@ impl HostServer {
             }
         };
 
-        let mut store = self.build_store()?;
+        let mut credentials = if read_only {
+            req.headers_mut()
+                .insert("x-onedrive-cache-only", http::HeaderValue::from_static("1"));
+            None
+        } else {
+            Some(
+                credentials::CredentialLease::acquire(
+                    &self.config.state_dir,
+                    self.config.account_dir.as_deref(),
+                )
+                .await?,
+            )
+        };
+        let mut store = self.build_store(read_only)?;
         let req = store
             .data_mut()
             .http()
@@ -621,11 +717,15 @@ impl HostServer {
                 .instantiate_async(&mut store)
                 .await
                 .map_err(|e| anyhow!("failed to instantiate component: {e}"))?;
-            proxy
+            let result = proxy
                 .wasi_http_incoming_handler()
                 .call_handle(store, req, out)
                 .await
-                .map_err(|e| anyhow!("component request failed: {e}"))?;
+                .map_err(|e| anyhow!("component request failed: {e}"));
+            if let Some(credentials) = credentials.as_mut() {
+                credentials.publish()?;
+            }
+            result?;
             Result::<()>::Ok(())
         });
 
@@ -660,6 +760,16 @@ impl HostServer {
             },
         }
     }
+}
+
+fn is_local_read<B>(req: &Request<B>) -> bool {
+    req.method() == http::Method::GET
+        && ((req
+            .headers()
+            .get("x-onedrive-plugin")
+            .is_some_and(|value| value == "1")
+            && matches!(req.uri().path(), "/_status" | "/_search" | "/_tree"))
+            || (req.uri().path() == "/" && !req.headers().contains_key("authorization")))
 }
 
 fn plain_response(status: StatusCode, message: &str) -> Response<HyperOutgoingBody> {
@@ -739,6 +849,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = HostConfig::parse()?;
+    let _state_owner = credentials::lock_state(&config.state_dir)?;
     let engine = build_engine()?;
     let pre = load_pre(&engine, &config.component_path).await?;
     let guest_env = GuestEnv::capture();
@@ -815,6 +926,68 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_local_cached_apis_and_bare_probes_use_the_read_lane() {
+        for path in ["/_status", "/_search?q=fixture", "/_tree?path=/"] {
+            let request = Request::builder()
+                .uri(path)
+                .header("x-onedrive-plugin", "1")
+                .header("authorization", "Basic fixture")
+                .body(())
+                .unwrap();
+            assert!(is_local_read(&request));
+        }
+        assert!(is_local_read(
+            &Request::builder().uri("/").body(()).unwrap()
+        ));
+        for (method, path, plugin, authorized) in [
+            ("POST", "/_status", true, true),
+            ("GET", "/_libraries", true, true),
+            ("GET", "/_resolve", true, true),
+            ("GET", "/_status", false, true),
+            ("GET", "/", false, true),
+            ("GET", "/document", false, false),
+        ] {
+            let mut request = Request::builder().method(method).uri(path);
+            if plugin {
+                request = request.header("x-onedrive-plugin", "1");
+            }
+            if authorized {
+                request = request.header("authorization", "Basic fixture");
+            }
+            assert!(!is_local_read(&request.body(()).unwrap()));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiters_do_not_exhaust_admission_queue() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let queued = AtomicUsize::new(0);
+        let held = semaphore.clone().acquire_owned().await.unwrap();
+        for _ in 0..QUEUE_LIMIT + 2 {
+            let future = acquire_execution_slot(&semaphore, &queued);
+            tokio::pin!(future);
+            tokio::select! {
+                biased;
+                _ = &mut future => panic!("busy slot must wait"),
+                _ = async {} => {}
+            }
+            assert_eq!(queued.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        queued.store(QUEUE_LIMIT, Ordering::Release);
+        assert!(acquire_execution_slot(&semaphore, &queued).await.is_err());
+        assert_eq!(queued.load(Ordering::Acquire), QUEUE_LIMIT);
+        queued.store(0, Ordering::Release);
+        semaphore.close();
+        assert!(acquire_execution_slot(&semaphore, &queued).await.is_err());
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        drop(held);
+        let semaphore = Arc::new(Semaphore::new(1));
+        assert!(acquire_execution_slot(&semaphore, &queued).await.is_ok());
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn outbound_policy_allows_known_microsoft_hosts() {

@@ -145,6 +145,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// is ever forwarded into a Graph `root:/...:` address.
 pub(crate) fn sanitize_path(raw: &str) -> Result<String, String> {
     let decoded = xml::pct_decode(raw).ok_or("malformed percent-encoding in path")?;
+    sanitize_decoded_path(&decoded)
+}
+
+pub(crate) fn sanitize_decoded_path(decoded: &str) -> Result<String, String> {
     if decoded.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err("control characters are not allowed in paths".to_string());
     }
@@ -193,6 +197,20 @@ fn destination_path(raw: &str) -> Result<String, String> {
         return Err("Destination host must be loopback".to_string());
     }
     Ok(path.to_string())
+}
+
+fn destination_for_request(raw: &str, authority: Option<&str>) -> Result<String, String> {
+    if let Some((scheme, rest)) = raw.trim().split_once("://") {
+        let destination_authority = rest.split('/').next().unwrap_or("");
+        if scheme != "http"
+            || !authority.is_some_and(|source| source.eq_ignore_ascii_case(destination_authority))
+        {
+            return Err(
+                "cross-library MOVE is not supported; Destination must use this endpoint".into(),
+            );
+        }
+    }
+    destination_path(raw)
 }
 
 fn is_loopback_hostport(hostport: &str) -> bool {
@@ -312,9 +330,16 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
     {
         match raw_path.as_str() {
             "/_status" | "_status" => return api::status(&config),
-            "/_tree" | "_tree" => return api::tree(&config, query.as_deref()),
+            "/_tree" | "_tree" => {
+                return api::tree(
+                    &config,
+                    query.as_deref(),
+                    header_value(&headers, "x-onedrive-cache-only").as_deref() == Some("1"),
+                );
+            }
             "/_search" | "_search" => return api::search(&config, query.as_deref()),
             "/_libraries" | "_libraries" => return api::libraries(&config, query.as_deref()),
+            "/_resolve" | "_resolve" => return api::resolve(&config, query.as_deref()),
             _ => {}
         }
     }
@@ -325,7 +350,9 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
     };
     let depth = header_value(&headers, "depth");
     let destination = match header_value(&headers, "destination") {
-        Some(d) => match destination_path(&d).and_then(|p| sanitize_path(&p)) {
+        Some(d) => match destination_for_request(&d, request.authority().as_deref())
+            .and_then(|p| sanitize_path(&p))
+        {
             Ok(p) => Some(p),
             Err(e) => return DavResponse::error(400, format!("bad Destination: {e}")),
         },
@@ -431,5 +458,17 @@ mod tests {
         assert!(destination_path("http://evil.example/x").is_err());
         assert!(destination_path("https://graph.microsoft.com/x").is_err());
         assert_eq!(destination_path("http://127.0.0.1").unwrap(), "/");
+    }
+
+    #[test]
+    fn move_cannot_change_library_endpoint() {
+        assert_eq!(
+            destination_for_request("http://127.0.0.1:8765/docs", Some("127.0.0.1:8765")).unwrap(),
+            "/docs"
+        );
+        assert!(
+            destination_for_request("http://127.0.0.1:8766/docs", Some("127.0.0.1:8765")).is_err()
+        );
+        assert_eq!(destination_for_request("/docs", None).unwrap(), "/docs");
     }
 }

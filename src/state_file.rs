@@ -1,7 +1,9 @@
 //! Small helpers for reading/writing a single file inside the preopened
 //! `/state` directory (used to persist `token.json`).
 
-use crate::bindings::wasi::filesystem::types::{Descriptor, DescriptorFlags, OpenFlags, PathFlags};
+use crate::bindings::wasi::filesystem::types::{
+    Descriptor, DescriptorFlags, ErrorCode, OpenFlags, PathFlags,
+};
 
 pub fn read_file(dir: &Descriptor, name: &str) -> Result<Option<Vec<u8>>, String> {
     let file = match dir.open_at(
@@ -11,7 +13,8 @@ pub fn read_file(dir: &Descriptor, name: &str) -> Result<Option<Vec<u8>>, String
         DescriptorFlags::READ,
     ) {
         Ok(f) => f,
-        Err(_) => return Ok(None), // treat "doesn't exist" (and any open error) as "no state yet"
+        Err(ErrorCode::NoEntry) => return Ok(None),
+        Err(error) => return Err(format!("failed opening {name}: {error:?}")),
     };
 
     let mut contents = Vec::new();
@@ -70,7 +73,8 @@ pub fn read_at(
         DescriptorFlags::READ,
     ) {
         Ok(f) => f,
-        Err(_) => return Ok(None),
+        Err(ErrorCode::NoEntry) => return Ok(None),
+        Err(error) => return Err(format!("failed opening {name}: {error:?}")),
     };
 
     let mut contents = Vec::new();

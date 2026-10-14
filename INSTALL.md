@@ -33,6 +33,9 @@ mount.
    ```
 
 5. Enable **Allow public client flows**.
+   For browser login also add `http://localhost/callback` as a native-client
+   redirect. The helper supplies an ephemeral localhost port and PKCE; no
+   client secret is used.
 6. Under **API permissions**, add delegated Microsoft Graph permissions:
    - `Files.ReadWrite.All`
    - `offline_access`
@@ -228,6 +231,115 @@ First verify the daemon answers WebDAV requests:
 ```sh
 curl -u "daemon:<your-secret>" -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8765/
 ```
+
+## Multiple accounts/libraries
+
+Use this with matching host, component and native helpers built from the M365
+implementation. Older release artifacts do not necessarily expose `/_resolve`
+or support `--account-dir`. The legacy single-library installation can continue
+running unchanged. No cloud files are moved or removed during migration.
+
+Install the native helpers together so their shared imports stay available:
+
+```sh
+install -d ~/.local/share/onedrive-davfs/tools
+install -m 755 tools/auth_common.py tools/browser-login.py tools/device-login.py \
+  tools/device-code-login.sh tools/profiles.py tools/profile-sync.py \
+  ~/.local/share/onedrive-davfs/tools/
+```
+
+Register an account and sign in to its isolated credential directory:
+
+```sh
+python3 tools/profiles.py account --id work --client-id YOUR_PUBLIC_CLIENT_ID \
+  --tenant YOUR_COMMERCIAL_TENANT_ID
+ONEDRIVE_ACCOUNT_DIR="$HOME/.config/onedrive-davfs/account-data/work" \
+ONEDRIVE_CLIENT_ID=YOUR_PUBLIC_CLIENT_ID \
+ONEDRIVE_TENANT_ID=YOUR_COMMERCIAL_TENANT_ID \
+python3 tools/browser-login.py
+```
+
+The default scope set is `offline_access Files.ReadWrite.All User.Read`.
+If site URL lookup needs `Sites.Read.All`, register it with `--scopes` and use
+the identical `ONEDRIVE_SCOPES` for login. Organizational consent/admin policy
+and access to the target site/library are still required.
+
+For the first library, run a temporary bootstrap host using **this same account
+store**, a distinct empty state directory, and a private environment file with
+matching client/tenant/scopes and a new Basic secret. Start it explicitly in a
+terminal (or your own temporary user unit); setup itself never starts services:
+
+```sh
+mkdir -p ~/.local/state/onedrive-davfs/bootstrap-work
+set -a
+. ~/.config/onedrive-davfs/work-bootstrap.env
+set +a
+~/.local/bin/onedrive-davfs-host --addr 127.0.0.1:8790 \
+  --state-dir "$HOME/.local/state/onedrive-davfs/bootstrap-work" \
+  --account-dir "$HOME/.config/onedrive-davfs/account-data/work" \
+  --component "$HOME/.local/share/onedrive-davfs/onedrive_davfs.wasm"
+```
+
+In another terminal verify/save the user's primary library, or use a known
+`drives/<id>` selector:
+
+```sh
+python3 tools/profiles.py library --account work \
+  --source-url http://127.0.0.1:8790/ \
+  --source-env ~/.config/onedrive-davfs/work-bootstrap.env \
+  --selector me/drive --name "Work OneDrive" --id workdocs
+```
+
+Verification checks the account's current login session, client, tenant and
+Graph identity before publishing. A separate login using an unrelated legacy
+endpoint is not an acceptable bootstrap source. New profiles receive unique
+ports, secrets and nonoverlapping mount/state directories. The registry is
+`~/.config/onedrive-davfs/profiles.json`; generated files are under its
+`library-data/workdocs/` directory.
+
+Review `fstab.entry` and add its line to `/etc/fstab` with your normal privileged
+editor. Append `davfs-secrets.entry` to `~/.davfs2/secrets` without replacing
+existing entries, keeping mode 600. Create the exact mountpoint recorded in
+the registry. Then install and enable **only this library's** generated units:
+
+```sh
+PROFILE="$HOME/.config/onedrive-davfs/library-data/workdocs"
+mkdir -p "$HOME/OneDrive-Libraries/workdocs" ~/.config/systemd/user
+install -m 644 "$PROFILE"/onedrive-davfs-workdocs*.service \
+  "$PROFILE"/onedrive-davfs-workdocs*.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now onedrive-davfs-workdocs.service \
+  onedrive-davfs-workdocs-mount.service onedrive-davfs-workdocs-sync.timer
+```
+
+Enabling these units launches the daemon/mount at future user logins and keeps
+its index timer active. Boot-before-login requires explicitly opting into
+systemd user lingering; ordinary login startup does not. Stop the temporary
+bootstrap host after the real library is available.
+
+Subsequent libraries use `library --source workdocs --selector drives/ID ...`,
+or the frontend's scoped picker. The picker **Save library** action generates
+configuration only: install its snippets/units explicitly as above before the
+new mount can work. It never stops other libraries. For a second account,
+repeat account registration/login/bootstrap using a distinct account ID.
+
+Reconnect commands are generated with the owning account's credential directory,
+tenant and scopes. Do not reuse another account's legacy reconnect command.
+Legacy indices lacking verified identity are recrawled; tokens and cloud data
+are preserved. Changing a live mount's configuration can leave existing davfs2
+file-cache contents until remount, so prefer a new library profile/mount rather
+than repurposing an existing mount across accounts.
+
+To remove a library from the unified UI, first stop/disable its daemon,
+mount unit and sync timer, then run `profiles.py remove-library --id workdocs`.
+Removal publishes only a registry change; it does not delete cached state,
+credentials or cloud files and never affects another profile's units.
+
+Compatibility is fixture-tested only. Optional live acceptance should begin
+with approved organizational metadata/PROPFIND/search and a small read-only
+download. Writes need an explicitly approved disposable library. Downloads
+remain buffered, PUT is limited to 64 MiB, locks are no-ops, cross-library MOVE
+is rejected, and this is not an Office coauthoring or offline sync client.
 
 Then test the mounted directory:
 

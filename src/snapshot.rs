@@ -578,6 +578,9 @@ mod tests {
     fn round_trip_preserves_tree_and_token() {
         let mut idx = Index {
             binding: Some(DriveBinding {
+                account_id: "user-a".into(),
+                credential_id: "login-a".into(),
+                client_id: None,
                 tenant_id: "common".into(),
                 drive_base: "me/drive".into(),
                 drive_id: "drive-123".into(),

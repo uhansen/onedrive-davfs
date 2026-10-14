@@ -139,7 +139,7 @@ pub fn propfind(config: &Config, path: &str, depth: Option<&str>) -> DavResponse
 }
 
 fn propfind_from_index(config: &Config, path: &str, depth: Option<&str>) -> Option<DavResponse> {
-    if !config.index_enabled {
+    if !config.cache_current() {
         return None;
     }
     let hit = match snapshot::lookup_file(&config.state_dir, path) {
@@ -227,7 +227,7 @@ pub fn head(config: &Config, path: &str) -> DavResponse {
 }
 
 fn head_from_index(config: &Config, path: &str) -> Option<DavResponse> {
-    if !config.index_enabled {
+    if !config.cache_current() {
         return None;
     }
     let hit = match snapshot::lookup_file(&config.state_dir, path) {
@@ -252,7 +252,7 @@ fn head_from_index(config: &Config, path: &str) -> Option<DavResponse> {
 }
 
 fn write_through(config: &Config, f: impl FnOnce(&mut crate::index::Index) -> bool) {
-    if !config.index_enabled {
+    if !config.cache_current() {
         return;
     }
     snapshot::mutate(&config.state_dir, f);

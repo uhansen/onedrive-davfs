@@ -19,7 +19,15 @@ pub fn run(config: &Config) -> DavResponse {
     }
     match run_inner(config) {
         Ok(report) => json_ok(report),
-        Err(e) => DavResponse::error(502, e),
+        Err(error) => {
+            let message = match sync_stats::save_failure(config, &error) {
+                Ok(()) => error,
+                Err(diagnostic_error) => {
+                    format!("{error}; could not persist sync diagnostic: {diagnostic_error}")
+                }
+            };
+            DavResponse::error(502, message)
+        }
     }
 }
 
@@ -50,9 +58,16 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
     let live = snapshot::load(&config.state_dir, INDEX_FILE)?;
     let rebuild = snapshot::load(&config.state_dir, REBUILD_FILE)?;
     let live_meta = snapshot::read_meta(&config.state_dir)?;
+    let has_live = live
+        .as_ref()
+        .is_some_and(|idx| idx.crawl_complete || idx.root.is_some());
 
     let binding_changed = existing_binding_mismatch(live_meta.as_ref(), &current_binding)
-        || (live.is_none() && rebuild.is_some());
+        || rebuild.as_ref().is_some_and(|idx| {
+            !idx.binding
+                .as_ref()
+                .is_some_and(|binding| binding.same_target(&current_binding))
+        });
     let live = if binding_changed {
         let generation = live
             .as_ref()
@@ -67,8 +82,6 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
             generation,
             ..Index::default()
         };
-        snapshot::save(&config.state_dir, INDEX_FILE, &idx)?;
-        let _ = state_file::remove_file(&config.state_dir, REBUILD_FILE);
         Some(idx)
     } else {
         live
@@ -81,7 +94,8 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
         INDEX_FILE
     };
     let mut idx = rebuild.or(live).unwrap_or_default();
-    if idx.binding.as_ref() != Some(&current_binding) {
+    let metadata_changed = idx.binding.as_ref() != Some(&current_binding);
+    if metadata_changed {
         idx.binding = Some(current_binding.clone());
     }
     let mut url = idx
@@ -92,8 +106,8 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
 
     let mut pages = 0usize;
     let mut applied = 0usize;
-    let mut dirty = false;
-    if let Ok(Some(meta)) = snapshot::read_meta(&config.state_dir) {
+    let mut dirty = binding_changed || metadata_changed;
+    if let Some(meta) = live_meta.as_ref() {
         // Snapshots written before total_* / built_at need a one-shot rewrite.
         if meta.built_at == 0 || (meta.total_dirs == 0 && meta.crawl_complete) {
             dirty = true;
@@ -155,16 +169,7 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
                 complete = false;
                 // Keep serving the existing live snapshot until the shadow
                 // crawl finishes, unless there is no live snapshot yet.
-                target = if snapshot::load(&config.state_dir, INDEX_FILE)
-                    .ok()
-                    .flatten()
-                    .map(|live| live.crawl_complete || live.root.is_some())
-                    .unwrap_or(false)
-                {
-                    REBUILD_FILE
-                } else {
-                    INDEX_FILE
-                };
+                target = if has_live { REBUILD_FILE } else { INDEX_FILE };
             }
             Err(DeltaError::Other(e)) => return Err(e),
         }
@@ -172,6 +177,12 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
 
     if dirty {
         snapshot::save(&config.state_dir, target, &idx)?;
+    }
+    if binding_changed
+        && target != REBUILD_FILE
+        && state_file::read_file(&config.state_dir, REBUILD_FILE)?.is_some()
+    {
+        state_file::remove_file(&config.state_dir, REBUILD_FILE)?;
     }
     if complete && target == REBUILD_FILE {
         state_file::rename(&config.state_dir, REBUILD_FILE, INDEX_FILE)?;
@@ -185,6 +196,7 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
         0.0
     };
     let stats = SyncStats {
+        binding: Some(current_binding.clone()),
         applied: applied as u64,
         pages: pages as u64,
         complete,
@@ -195,7 +207,8 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
         has_token: idx.delta_token.is_some(),
         target: target.to_string(),
     };
-    let _ = sync_stats::save(&config.state_dir, &stats);
+    sync_stats::save(&config.state_dir, &stats)?;
+    sync_stats::clear_failure(config)?;
 
     Ok(serde_json::json!({
         "applied": applied,
@@ -226,7 +239,7 @@ fn existing_binding_mismatch(
     match meta {
         None => false,
         Some(meta) => match meta.binding.as_ref() {
-            Some(saved) => saved != current,
+            Some(saved) => !saved.same_target(current),
             None => true,
         },
     }
@@ -267,6 +280,9 @@ mod tests {
     #[test]
     fn legacy_or_changed_binding_triggers_rebuild() {
         let current = DriveBinding {
+            account_id: "user-a".into(),
+            credential_id: "login-a".into(),
+            client_id: None,
             tenant_id: "common".into(),
             drive_base: "me/drive".into(),
             drive_id: "drive-a".into(),

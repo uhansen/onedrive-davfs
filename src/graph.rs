@@ -14,8 +14,8 @@ use crate::config::Config;
 use crate::http_client::{self, HttpRequest};
 use crate::index::{DeltaItem, DriveBinding, ItemMeta};
 
-/// Graph's simple (non-chunked) upload only supports files up to ~4 MiB.
-/// Larger files go through `createUploadSession` + chunked `Content-Range`.
+/// This implementation uses simple uploads up to 4 MiB; larger files use
+/// `createUploadSession` with chunked `Content-Range`.
 pub const MAX_SIMPLE_UPLOAD_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Hard ceiling on a single `PUT`: the whole body is buffered in the guest.
@@ -182,7 +182,15 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 fn drive_root_segment(drive_base: &str) -> String {
-    format!("/{}", drive_base.trim_matches('/'))
+    format!(
+        "/{}",
+        drive_base
+            .trim_matches('/')
+            .split('/')
+            .map(crate::xml::pct_encode)
+            .collect::<Vec<_>>()
+            .join("/")
+    )
 }
 
 /// Graph `parentReference.path` uses `/<drive>/root:` for the drive root
@@ -234,12 +242,153 @@ fn graph_request(
     if let Some(ct) = content_type {
         headers.push(("content-type", ct));
     }
-    http_client::send(HttpRequest {
+    send_with_read_retry(HttpRequest {
         method,
         url,
         headers: &headers,
         body,
     })
+}
+
+fn send_with_read_retry(request: HttpRequest<'_>) -> Result<http_client::HttpResponse, String> {
+    for attempt in 0..=2 {
+        let response = http_client::send(HttpRequest {
+            method: request.method.clone(),
+            url: request.url,
+            headers: request.headers,
+            body: request.body,
+        })?;
+        if !matches!(request.method, Method::Get | Method::Head)
+            || !matches!(response.status, 429 | 503)
+        {
+            return Ok(response);
+        }
+        let seconds = retry_delay(
+            response.header_value("retry-after").as_deref(),
+            crate::auth::now_secs(),
+        )?;
+        if attempt == 2 {
+            return Err(format!(
+                "Microsoft Graph is throttled/unavailable (HTTP {}); retry later",
+                response.status
+            ));
+        }
+        wait_seconds(seconds);
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+fn retry_delay(header: Option<&str>, now: u64) -> Result<u64, String> {
+    let seconds = match header {
+        None => 1,
+        Some(value) => match value.trim().parse::<u64>() {
+            Ok(seconds) => seconds,
+            Err(_) => parse_http_date(value)
+                .map(|date| date.saturating_sub(now))
+                .ok_or("Microsoft Graph returned invalid Retry-After; retry later")?,
+        },
+    };
+    if seconds > 10 {
+        return Err(format!(
+            "Microsoft Graph requested Retry-After {seconds}s; deferred to a later request"
+        ));
+    }
+    Ok(seconds)
+}
+
+fn parse_http_date(value: &str) -> Option<u64> {
+    let fields: Vec<_> = value.split_whitespace().collect();
+    let [weekday, day, month, year, time, "GMT"] = fields[..] else {
+        return None;
+    };
+    if !matches!(
+        weekday,
+        "Mon," | "Tue," | "Wed," | "Thu," | "Fri," | "Sat," | "Sun,"
+    ) {
+        return None;
+    }
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|name| *name == month)? as u32
+        + 1;
+    let year = year.parse::<i64>().ok()?;
+    let day = day.parse::<u32>().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    let parts: Vec<_> = time.split(':').collect();
+    let [hour, minute, second] = parts[..] else {
+        return None;
+    };
+    let (hour, minute, second) = (
+        hour.parse::<u32>().ok()?,
+        minute.parse::<u32>().ok()?,
+        second.parse::<u32>().ok()?,
+    );
+    if !(1601..=9999).contains(&year)
+        || day == 0
+        || day > month_days
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(
+        (days_from_civil(year, month, day) * 86400 + i64::from(hour * 3600 + minute * 60 + second))
+            .max(0) as u64,
+    )
+}
+
+fn graph_failure(operation: &str, response: &http_client::HttpResponse) -> String {
+    let payload = serde_json::from_slice::<serde_json::Value>(&response.body).ok();
+    let code = payload
+        .as_ref()
+        .and_then(|value| value.pointer("/error/code"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let challenge = response
+        .header_value("www-authenticate")
+        .unwrap_or_default();
+    let advice = if code.eq_ignore_ascii_case("insufficient_claims")
+        || challenge.contains("insufficient_claims")
+    {
+        "Conditional access requires interactive sign-in or a compliant device; tenant policies cannot be bypassed"
+    } else {
+        match response.status {
+            401 => {
+                "Sign in again; credentials are expired, revoked, or not accepted by this tenant"
+            }
+            403 => {
+                "Access denied; check user library permissions, delegated/admin consent, and tenant policy"
+            }
+            404 => {
+                "Library or item not found or inaccessible; verify the explicit drive/site/group target"
+            }
+            429 | 503 => "Microsoft Graph is throttled/unavailable; retry later",
+            _ => "Microsoft Graph request failed; check library policy and operation support",
+        }
+    };
+    format!("{operation} failed (HTTP {}): {advice}", response.status)
+}
+
+fn wait_seconds(seconds: u64) {
+    #[cfg(target_arch = "wasm32")]
+    crate::bindings::wasi::clocks::monotonic_clock::subscribe_duration(seconds * 1_000_000_000)
+        .block();
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
 }
 
 fn to_item(item: &DriveItem) -> GraphItem {
@@ -324,24 +473,49 @@ fn library_info(drive: DriveResource) -> Option<LibraryInfo> {
 }
 
 pub fn current_drive_binding(config: &Config) -> Result<DriveBinding, String> {
+    resolve_drive(config, &config.drive_base)
+}
+
+pub fn resolve_drive(config: &Config, selector: &str) -> Result<DriveBinding, String> {
+    let account_response = graph_request(
+        config,
+        Method::Get,
+        "https://graph.microsoft.com/v1.0/me?$select=id",
+        None,
+        &[],
+    )?;
+    if account_response.status != 200 {
+        return Err(graph_failure(
+            "Account identity verification",
+            &account_response,
+        ));
+    }
+    let account: serde_json::Value = serde_json::from_slice(&account_response.body)
+        .map_err(|_| "invalid account identity response".to_string())?;
+    let account_id = account["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("account identity missing id")?
+        .to_string();
     let url = format!(
         "https://graph.microsoft.com/v1.0{}?$select=id,name,driveType,webUrl,owner,createdBy",
-        drive_root_segment(&config.drive_base)
+        drive_root_segment(selector)
     );
     let response = graph_request(config, Method::Get, &url, None, &[])?;
     if response.status != 200 {
-        return Err(format!(
-            "graph drive metadata failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Drive verification", &response));
     }
     let drive: DriveResource = serde_json::from_slice(&response.body)
         .map_err(|e| format!("failed to parse drive metadata: {e}"))?;
     let info = library_info(drive).ok_or_else(|| "drive metadata missing id".to_string())?;
+    crate::config::validate_selector_id(&info.drive_id, "resolved drive id")?;
+    let credential_id = crate::auth::bind_legacy_credential(config, &account_id)?;
     Ok(DriveBinding {
+        account_id,
+        credential_id,
+        client_id: config.client_id.clone(),
         tenant_id: config.tenant_id.clone(),
-        drive_base: config.drive_base.clone(),
+        drive_base: selector.to_string(),
         drive_id: info.drive_id,
         drive_name: info.drive_name,
         drive_type: info.drive_type,
@@ -372,22 +546,27 @@ pub fn list_libraries(
     config: &Config,
     scope: LibraryScope<'_>,
 ) -> Result<Vec<LibraryInfo>, String> {
+    match &scope {
+        LibraryScope::Me => {}
+        LibraryScope::Group(id) | LibraryScope::Site(id) => {
+            crate::config::validate_selector_id(id, "discovery scope id")?;
+        }
+    }
     let mut url = library_list_url(scope);
     let mut libraries = Vec::new();
     let mut pages = 0usize;
     loop {
         let response = graph_request(config, Method::Get, &url, None, &[])?;
         if response.status != 200 {
-            return Err(format!(
-                "graph library discovery failed with status {}: {}",
-                response.status,
-                String::from_utf8_lossy(&response.body)
-            ));
+            return Err(graph_failure("Scoped library discovery", &response));
         }
         let page: DriveResourcePage = serde_json::from_slice(&response.body)
             .map_err(|e| format!("failed to parse library discovery response: {e}"))?;
         libraries.extend(page.value.into_iter().filter_map(library_info));
         pages += 1;
+        if libraries.len() > 1000 || (pages >= 10 && page.next_link.is_some()) {
+            return Err("library discovery exceeded 10 pages/1000 libraries; choose a narrower site/group scope".into());
+        }
         match page.next_link {
             Some(next) => url = validate_next_link(&next, pages)?,
             None => break,
@@ -410,10 +589,9 @@ pub fn resolve_site_by_url(config: &Config, site_url: &str) -> Result<ResolvedSi
     );
     let response = graph_request(config, Method::Get, &url, None, &[])?;
     if response.status != 200 {
-        return Err(format!(
-            "graph site resolve failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
+        return Err(graph_failure(
+            "Site resolution (may require Sites.Read.All consent)",
+            &response,
         ));
     }
     let site: SiteResource = serde_json::from_slice(&response.body)
@@ -441,11 +619,27 @@ fn parse_sharepoint_site_url(site_url: &str) -> Result<(String, String), String>
     if !(host.ends_with(".sharepoint.com") || host.ends_with(".sharepoint-df.com")) {
         return Err("siteUrl must target a sharepoint.com or sharepoint-df.com host".to_string());
     }
-    let path = format!("/{}", path_with_rest.split(['?', '#']).next().unwrap_or(""));
+    if host.contains('@')
+        || host.contains(':')
+        || host
+            .chars()
+            .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '.'))
+    {
+        return Err("invalid SharePoint hostname".into());
+    }
+    let path = crate::sanitize_path(&format!(
+        "/{}",
+        path_with_rest.split(['?', '#']).next().unwrap_or("")
+    ))?;
     if path == "/" {
         return Err("siteUrl must include a concrete site path".to_string());
     }
-    Ok((host.to_string(), path))
+    let encoded = path
+        .split('/')
+        .map(crate::xml::pct_encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok((host.to_string(), encoded))
 }
 
 pub struct DeltaPage {
@@ -525,10 +719,9 @@ pub fn delta(config: &Config, url: &str) -> Result<DeltaPage, DeltaError> {
         return Err(DeltaError::Resync);
     }
     if response.status != 200 {
-        return Err(DeltaError::Other(format!(
-            "graph delta failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
+        return Err(DeltaError::Other(graph_failure(
+            "Index synchronization",
+            &response,
         )));
     }
     parse_delta_page(&response.body).map_err(DeltaError::Other)
@@ -561,11 +754,7 @@ pub fn stat(config: &Config, path: &str) -> Result<GraphItem, String> {
         return Err("not found".to_string());
     }
     if response.status != 200 {
-        return Err(format!(
-            "graph stat failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Item metadata", &response));
     }
     let item: DriveItem = serde_json::from_slice(&response.body)
         .map_err(|e| format!("failed to parse drive item: {e}"))?;
@@ -584,11 +773,7 @@ pub fn children(config: &Config, path: &str) -> Result<Vec<GraphItem>, String> {
     loop {
         let response = graph_request(config, Method::Get, &url, None, &[])?;
         if response.status != 200 {
-            return Err(format!(
-                "graph children failed with status {}: {}",
-                response.status,
-                String::from_utf8_lossy(&response.body)
-            ));
+            return Err(graph_failure("Folder listing", &response));
         }
         let page: DriveItemPage = serde_json::from_slice(&response.body)
             .map_err(|e| format!("failed to parse children page: {e}"))?;
@@ -646,12 +831,10 @@ pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
                 .ok_or_else(|| "graph get_content redirect missing Location header".to_string())?;
             let location = location.trim();
             if !is_https_url(location) {
-                return Err(format!(
-                    "graph get_content redirect is not https: {location}"
-                ));
+                return Err("Graph content redirect must use HTTPS".into());
             }
 
-            let redirected = http_client::send(HttpRequest {
+            let redirected = send_with_read_retry(HttpRequest {
                 method: Method::Get,
                 url: &location,
                 headers: &[],
@@ -665,10 +848,7 @@ pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
             }
             Ok(redirected.body)
         }
-        _ => Err(format!(
-            "graph get_content failed with status {}",
-            response.status
-        )),
+        _ => Err(graph_failure("Content download", &response)),
     }
 }
 
@@ -699,11 +879,7 @@ fn put_simple(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaI
         bytes,
     )?;
     if response.status != 200 && response.status != 201 {
-        return Err(format!(
-            "graph put_content failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Content upload", &response));
     }
     Ok(serde_json::from_slice::<DriveItem>(&response.body)
         .ok()
@@ -734,11 +910,7 @@ fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<Delta
         body.to_string().as_bytes(),
     )?;
     if response.status != 200 && response.status != 201 {
-        return Err(format!(
-            "graph createUploadSession failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Upload session creation", &response));
     }
     let session: UploadSession = serde_json::from_slice(&response.body)
         .map_err(|e| format!("failed to parse upload session: {e}"))?;
@@ -773,13 +945,7 @@ fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<Delta
                 sent.status == 202
             };
             if !ok {
-                return Err(format!(
-                    "graph upload session chunk {}-{} failed with status {}: {}",
-                    offset,
-                    end - 1,
-                    sent.status,
-                    String::from_utf8_lossy(&sent.body)
-                ));
+                return Err(graph_failure("Upload session chunk", &sent));
             }
             if last {
                 last_item = serde_json::from_slice::<DriveItem>(&sent.body)
@@ -824,11 +990,7 @@ pub fn create_folder(
         body.to_string().as_bytes(),
     )?;
     if response.status != 201 {
-        return Err(format!(
-            "graph create_folder failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Folder creation", &response));
     }
     Ok(serde_json::from_slice::<DriveItem>(&response.body)
         .ok()
@@ -842,10 +1004,7 @@ pub fn delete(config: &Config, path: &str) -> Result<(), String> {
     );
     let response = graph_request(config, Method::Delete, &url, None, &[])?;
     if response.status != 204 && response.status != 404 {
-        return Err(format!(
-            "graph delete failed with status {}",
-            response.status
-        ));
+        return Err(graph_failure("Item deletion", &response));
     }
     Ok(())
 }
@@ -881,11 +1040,7 @@ pub fn move_or_rename(
         body.to_string().as_bytes(),
     )?;
     if response.status != 200 {
-        return Err(format!(
-            "graph move_or_rename failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Item move/rename", &response));
     }
     Ok(serde_json::from_slice::<DriveItem>(&response.body)
         .ok()
@@ -895,6 +1050,30 @@ pub fn move_or_rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enterprise_errors_are_actionable_without_echoing_payloads() {
+        for (status, expected) in [
+            (401, "Sign in again"),
+            (403, "Access denied"),
+            (404, "not found"),
+        ] {
+            let response = http_client::HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: br#"{"error":{"code":"private-code","message":"private-token"}}"#.to_vec(),
+            };
+            let error = graph_failure("Fixture", &response);
+            assert!(error.contains(expected));
+            assert!(!error.contains("private"));
+        }
+        let response = http_client::HttpResponse {
+            status: 403,
+            headers: Vec::new(),
+            body: br#"{"error":{"code":"insufficient_claims","message":"private-token"}}"#.to_vec(),
+        };
+        assert!(graph_failure("Fixture", &response).contains("Conditional access"));
+    }
 
     #[test]
     fn parses_iso8601_utc() {
@@ -1046,5 +1225,41 @@ mod tests {
             None,
         ]);
         assert_eq!(label, "Ada Lovelace");
+    }
+
+    #[test]
+    fn read_retry_delays_are_bounded_and_not_shortened() {
+        assert_eq!(retry_delay(None, 0).unwrap(), 1);
+        assert_eq!(retry_delay(Some("0"), 0).unwrap(), 0);
+        assert_eq!(retry_delay(Some("10"), 0).unwrap(), 10);
+        assert!(retry_delay(Some("11"), 0).is_err());
+        assert!(retry_delay(Some("invalid"), 0).is_err());
+        assert_eq!(
+            retry_delay(Some("Wed, 21 Oct 2015 07:28:00 GMT"), 1445412475).unwrap(),
+            5
+        );
+        assert_eq!(
+            retry_delay(Some("Wed, 21 Oct 2015 07:28:00 GMT"), 1445412481).unwrap(),
+            0
+        );
+        assert!(retry_delay(Some("Wed, 31 Feb 2015 07:28:00 GMT"), 0).is_err());
+    }
+
+    #[test]
+    fn business_and_channel_library_paths_are_encoded() {
+        assert_eq!(
+            item_path_segment("drives/b!fixture", "/100% complete #2026/Report.docx"),
+            "/drives/b%21fixture/root:/100%25%20complete%20%232026/Report.docx:"
+        );
+        assert_eq!(
+            item_path_segment("drives/b!abc-123_X", "/Shared files/a.docx"),
+            "/drives/b%21abc-123_X/root:/Shared%20files/a.docx:"
+        );
+        assert_eq!(
+            item_path_segment("sites/tenant.sharepoint.com,site,web/drive", "/"),
+            "/sites/tenant.sharepoint.com%2Csite%2Cweb/drive/root"
+        );
+        assert!(parse_sharepoint_site_url("https://user@tenant.sharepoint.com/sites/x").is_err());
+        assert!(parse_sharepoint_site_url("https://tenant.sharepoint.com/sites/../x").is_err());
     }
 }

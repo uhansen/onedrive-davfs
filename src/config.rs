@@ -17,7 +17,7 @@ pub struct Config {
     pub auth_scopes: String,
     pub basic_auth_secret: Option<String>,
     /// Preopened directory used to persist `token.json`. Must be granted to
-    /// the component via `wasmtime serve --dir <path>::/state`.
+    /// the component by the native Wasmtime host.
     pub state_dir: Descriptor,
     /// Serve PROPFIND/HEAD from the local snapshot. `ONEDRIVE_INDEX_ENABLED=0`
     /// restores live Graph listings.
@@ -36,12 +36,33 @@ fn env(name: &str) -> Option<String> {
 }
 
 impl Config {
+    pub fn cache_current(&self) -> bool {
+        if !self.index_enabled {
+            return false;
+        }
+        let Ok(Some(meta)) = crate::snapshot::read_meta(&self.state_dir) else {
+            return false;
+        };
+        let Ok(credential_id) = crate::auth::credential_id(self) else {
+            return false;
+        };
+        meta.binding.is_some_and(|binding| {
+            binding.matches_configuration(
+                &self.tenant_id,
+                self.client_id.as_deref(),
+                &self.drive_base,
+                credential_id.as_deref(),
+            )
+        })
+    }
+
     /// Loads configuration from the environment and preopens. A client id
     /// is optional at startup so a pre-seeded, still-valid access token can
     /// be used immediately; only token refresh requires `ONEDRIVE_CLIENT_ID`.
     pub fn load() -> Result<Self, String> {
         let client_id = env("ONEDRIVE_CLIENT_ID");
         let tenant_id = env("ONEDRIVE_TENANT_ID").unwrap_or_else(|| "common".to_string());
+        validate_authority(&tenant_id)?;
         let drive_base = normalize_drive_base(
             &env("ONEDRIVE_DRIVE_BASE").unwrap_or_else(|| "me/drive".to_string()),
         )?;
@@ -99,12 +120,25 @@ fn normalize_auth_scopes(raw: &str) -> Result<String, String> {
     if scopes.is_empty() {
         return Err("ONEDRIVE_SCOPES must contain at least one OAuth scope".to_string());
     }
+    if !scopes.contains(&"offline_access")
+        || scopes.iter().any(|scope| {
+            !matches!(
+                *scope,
+                "offline_access" | "Files.ReadWrite.All" | "User.Read" | "Sites.Read.All"
+            )
+        })
+    {
+        return Err(
+            "ONEDRIVE_SCOPES must include offline_access and only supported delegated Graph scopes"
+                .into(),
+        );
+    }
     Ok(scopes.join(" "))
 }
 
 pub fn normalize_drive_base(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().trim_matches('/');
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("me/drive") {
+    if trimmed.eq_ignore_ascii_case("me/drive") {
         return Ok("me/drive".to_string());
     }
     if let Some(rest) = trimmed.strip_prefix("drives/") {
@@ -127,8 +161,8 @@ pub fn normalize_drive_base(raw: &str) -> Result<String, String> {
     Ok(format!("drives/{trimmed}"))
 }
 
-fn validate_selector_id(value: &str, label: &str) -> Result<(), String> {
-    if value.is_empty() {
+pub(crate) fn validate_selector_id(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || matches!(value, "." | "..") {
         return Err(format!("{label} must not be empty"));
     }
     if value.contains('/') || value.contains('\\') {
@@ -136,9 +170,22 @@ fn validate_selector_id(value: &str, label: &str) -> Result<(), String> {
     }
     if value
         .chars()
-        .any(|c| c.is_control() || matches!(c, '?' | '#'))
+        .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '!' | '-' | '_' | '.' | '@' | ','))
     {
         return Err(format!("{label} contains unsupported characters"));
+    }
+    Ok(())
+}
+
+fn validate_authority(tenant: &str) -> Result<(), String> {
+    if tenant.is_empty()
+        || !tenant
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+    {
+        return Err(
+            "ONEDRIVE_TENANT_ID must be a tenant id/domain or a supported authority name".into(),
+        );
     }
     Ok(())
 }
@@ -225,6 +272,9 @@ mod tests {
         );
         assert!(normalize_drive_base("users/alice/drive/root").is_err());
         assert!(normalize_drive_base("../bad").is_err());
+        assert!(normalize_drive_base("").is_err());
+        assert!(normalize_drive_base("drives/..").is_err());
+        assert!(normalize_drive_base("b!abc%2fother").is_err());
     }
 
     #[test]
