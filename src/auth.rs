@@ -40,6 +40,14 @@ struct TokenResponse {
     expires_in: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct TokenErrorResponse {
+    #[serde(default)]
+    error: String,
+    #[serde(rename = "error_description", default)]
+    error_description: String,
+}
+
 fn now_secs() -> u64 {
     wall_clock::now().seconds
 }
@@ -70,7 +78,7 @@ fn refresh(config: &Config, refresh_token: &str) -> Result<TokenFile, String> {
         "client_id={}&grant_type=refresh_token&refresh_token={}&scope={}",
         urlencode(client_id),
         urlencode(refresh_token),
-        urlencode("offline_access Files.ReadWrite.All User.Read"),
+        urlencode(&config.auth_scopes),
     );
 
     let response = http_client::send(HttpRequest {
@@ -81,11 +89,7 @@ fn refresh(config: &Config, refresh_token: &str) -> Result<TokenFile, String> {
     })?;
 
     if response.status != 200 {
-        return Err(format!(
-            "token refresh failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(format_token_error(response.status, &response.body));
     }
 
     let parsed: TokenResponse = serde_json::from_slice(&response.body)
@@ -101,6 +105,26 @@ fn refresh(config: &Config, refresh_token: &str) -> Result<TokenFile, String> {
         access_token: Some(parsed.access_token),
         expires_at: now_secs() + parsed.expires_in.saturating_sub(EXPIRY_SAFETY_MARGIN_SECS),
     })
+}
+
+fn format_token_error(status: u16, body: &[u8]) -> String {
+    if let Ok(parsed) = serde_json::from_slice::<TokenErrorResponse>(body) {
+        let code = if parsed.error.is_empty() {
+            "unknown_error"
+        } else {
+            parsed.error.as_str()
+        };
+        let detail = parsed.error_description.trim();
+        if detail.is_empty() {
+            return format!("token refresh failed with status {status}: {code}");
+        }
+        return format!("token refresh failed with status {status}: {code}: {detail}");
+    }
+    format!(
+        "token refresh failed with status {}: {}",
+        status,
+        String::from_utf8_lossy(body)
+    )
 }
 
 /// Returns a valid `Authorization: Bearer ...` value, refreshing the
@@ -141,4 +165,18 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_error_prefers_oauth_shape() {
+        let body =
+            br#"{"error":"invalid_grant","error_description":"AADSTS700082: The refresh token has expired."}"#;
+        let out = format_token_error(400, body);
+        assert!(out.contains("invalid_grant"));
+        assert!(out.contains("AADSTS700082"));
+    }
 }

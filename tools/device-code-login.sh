@@ -20,7 +20,7 @@ umask 077
 STATE_DIR="${1:-$HOME/.local/state/onedrive-davfs}"
 TENANT_ID="${2:-${ONEDRIVE_TENANT_ID:-common}}"
 CLIENT_ID="${ONEDRIVE_CLIENT_ID:?Set ONEDRIVE_CLIENT_ID to your Azure AD app application (client) ID}"
-SCOPES="offline_access Files.ReadWrite.All User.Read"
+SCOPES="${ONEDRIVE_SCOPES:-offline_access Files.ReadWrite.All User.Read}"
 
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"

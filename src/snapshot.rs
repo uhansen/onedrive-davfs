@@ -8,7 +8,7 @@
 //!   meta JSON
 
 use crate::bindings::wasi::filesystem::types::Descriptor;
-use crate::index::{Index, ItemMeta, Node, normalize_path, parent_path};
+use crate::index::{DriveBinding, Index, ItemMeta, Node, normalize_path, parent_path};
 use crate::state_file;
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +21,8 @@ const HEADER_LEN: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotMeta {
+    #[serde(default)]
+    pub binding: Option<DriveBinding>,
     pub delta_token: Option<String>,
     pub pending_next_link: Option<String>,
     pub crawl_complete: bool,
@@ -141,6 +143,7 @@ pub fn encode(index: &Index) -> Result<Vec<u8>, String> {
     }
 
     let meta = SnapshotMeta {
+        binding: index.binding.clone(),
         delta_token: index.delta_token.clone(),
         pending_next_link: index.pending_next_link.clone(),
         crawl_complete: index.crawl_complete,
@@ -172,6 +175,7 @@ pub fn decode(bytes: &[u8]) -> Result<Index, String> {
     let rows = parse_dir_table(table, dir_count)?;
 
     let mut index = Index {
+        binding: meta.binding,
         delta_token: meta.delta_token,
         pending_next_link: meta.pending_next_link,
         crawl_complete: meta.crawl_complete,
@@ -573,6 +577,15 @@ mod tests {
     #[test]
     fn round_trip_preserves_tree_and_token() {
         let mut idx = Index {
+            binding: Some(DriveBinding {
+                tenant_id: "common".into(),
+                drive_base: "me/drive".into(),
+                drive_id: "drive-123".into(),
+                drive_name: "Documents".into(),
+                drive_type: "business".into(),
+                web_url: "https://tenant.sharepoint.com/personal/me/Documents".into(),
+                owner_label: "Ada Lovelace".into(),
+            }),
             generation: 3,
             crawl_complete: true,
             delta_token: Some(
@@ -613,6 +626,7 @@ mod tests {
         assert_eq!(out.resolve("/Docs/a.txt").as_deref(), Some("f"));
         assert_eq!(out.nodes.get("f").unwrap().meta.size, 9);
         assert_eq!(out.delta_token, idx.delta_token);
+        assert_eq!(out.binding, idx.binding);
         assert!(out.crawl_complete);
         assert_eq!(out.generation, 3);
         let (_off, _count, meta_off, meta_len) = parse_header(&bytes).unwrap();
@@ -620,6 +634,7 @@ mod tests {
         assert_eq!(meta.total_dirs, 2);
         assert_eq!(meta.total_files, 1);
         assert!(meta.built_at > 0);
+        assert_eq!(meta.binding, idx.binding);
 
         let hit = lookup_bytes(&bytes, "/Docs").unwrap().unwrap();
         match hit {

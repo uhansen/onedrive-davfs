@@ -37,6 +37,7 @@ mount.
    - `Files.ReadWrite.All`
    - `offline_access`
    - `User.Read`
+   - optional, only for scoped SharePoint site discovery: `Sites.Read.All`
 7. Copy the **Application (client) ID**. You will use it as `ONEDRIVE_CLIENT_ID`.
 
 ## 3. Download the prebuilt host and WebAssembly component
@@ -88,16 +89,16 @@ gh attestation verify ~/.local/share/onedrive-davfs/onedrive_davfs.wasm \
 This creates `~/.local/state/onedrive-davfs/token.json`, which the daemon uses
 and refreshes later.
 
+Use either helper:
+
 ```sh
 ONEDRIVE_CLIENT_ID=<your-app-id> ./tools/device-code-login.sh
+ONEDRIVE_CLIENT_ID=<your-app-id> python3 ./tools/browser-login.py
 ```
 
-The script will print:
-
-- a Microsoft login URL
-- a short device code
-
-Complete the sign-in in a browser and wait for the script to finish.
+The device-code helper prints a Microsoft login URL and short code.
+The browser helper opens the authorization page directly and completes a
+loopback authorization-code + PKCE exchange.
 
 ## 5. Install the systemd files
 
@@ -130,6 +131,7 @@ Set at least:
 ```dotenv
 ONEDRIVE_CLIENT_ID=<your-app-id>
 ONEDRIVE_TENANT_ID=common
+ONEDRIVE_SCOPES=offline_access Files.ReadWrite.All User.Read
 ONEDRIVE_DRIVE_BASE=me/drive
 ONEDRIVE_BASIC_AUTH_SECRET=<long-random-secret>
 ```
@@ -143,7 +145,10 @@ openssl rand -base64 32
 Notes:
 
 - `ONEDRIVE_DRIVE_BASE=me/drive` is the default for the signed-in account's primary drive.
-- You can also use a plain drive ID such as `B087983F641B9ED3`.
+- You can also use a plain drive ID such as `B087983F641B9ED3`, `drives/<id>`,
+  `users/<id>/drive`, `groups/<id>/drive`, or `sites/<id>/drive`.
+- Add `Sites.Read.All` to `ONEDRIVE_SCOPES` only when you need scoped site
+  discovery.
 - Keep this file mode `600`.
 
 ## 7. Enable the daemon

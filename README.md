@@ -68,6 +68,7 @@ Implemented, against the real Microsoft Graph API:
   never sends this header, so OneDrive folders named `_status`/`_tree`/`_search`
   stay reachable as WebDAV):
   - `GET /_status` -- index crawl progress, item counts, last `/_sync` tick
+    and the current bound drive identity (tenant, selector, drive id/name/type)
   - `GET /_tree?path=/…` -- one directory of the index (Graph fallback on miss)
   - `GET /_search?q=<term>` -- case-insensitive substring search over the
     index by name, files **and** folders (unlike `/_tree`, which is
@@ -76,6 +77,11 @@ Implemented, against the real Microsoft Graph API:
     enabled or hasn't crawled yet; `q` shorter than 2 characters returns an
     empty result set; results are capped (100) with `"truncated":true` if
     the cap was hit, directories sorted first, then by path.
+  - `GET /_libraries` -- scoped library discovery for the signed-in account.
+    With no query it lists the user's accessible drives (`/me/drives`);
+    `groupId=<id>` scopes to one Microsoft 365 group; `siteId=<id>` scopes to
+    one SharePoint site; `siteUrl=<https://tenant.sharepoint.com/sites/...>`
+    resolves that site first, then lists its libraries.
 
 These report **metadata-index** progress (items applied per tick), not
 file-transfer bandwidth: each `GET`/`PUT` is still a direct Graph call.
@@ -101,24 +107,32 @@ Explicitly **not** implemented yet:
    flow used below).
 4. Under API permissions, add delegated Microsoft Graph scopes:
    `Files.ReadWrite.All`, `offline_access`, `User.Read`.
+   Add `Sites.Read.All` only if you want scoped SharePoint site discovery.
 5. Copy the **Application (client) ID** from the Overview page --
    that's `ONEDRIVE_CLIENT_ID` below. No client secret is needed (this is
-   a public client using the device code flow).
+   a public client using the device code or browser/PKCE flow).
 
 ### 2. First-time sign-in (device code flow, run once)
 
-Interactive browser sign-in can't happen inside the wasm sandbox, so it's
-a plain native script:
+Interactive browser sign-in can't happen inside the wasm sandbox, so it stays
+in native helpers. You can use either:
 
 ```sh
 ONEDRIVE_CLIENT_ID=<your-app-id> ./tools/device-code-login.sh
 ```
 
-This prints a URL and a short code, waits for you to complete sign-in in
-a browser, and writes `~/.local/state/onedrive-davfs/token.json`
-containing a refresh token. Re-run this script only if that refresh token
-is ever revoked; the daemon itself keeps it alive by refreshing it before
-each expiry.
+or:
+
+```sh
+ONEDRIVE_CLIENT_ID=<your-app-id> python3 ./tools/browser-login.py
+```
+
+The device-code helper prints a URL and short code; the browser helper opens
+the authorization page directly, listens on a loopback callback, and completes
+an authorization-code + PKCE exchange. Both write
+`~/.local/state/onedrive-davfs/token.json` containing a refresh token.
+Re-run a helper only if that refresh token is revoked; the daemon itself keeps
+it alive by refreshing it before each expiry.
 
 ### 3. Configure and run the daemon
 
@@ -148,9 +162,18 @@ directly. `ONEDRIVE_CLIENT_ID` becomes mandatory only when the daemon needs
 to refresh an expired token.
 
 `ONEDRIVE_DRIVE_BASE` defaults to `me/drive`, which targets the signed-in
-account's primary drive. You can also set it to a plain drive ID
-(`B087983F641B9ED3`) or another Graph drive selector such as
-`users/<user-id>/drive`.
+account's primary drive. You can also set it to:
+
+- a plain drive ID (`B087983F641B9ED3`)
+- `drives/<drive-id>`
+- `users/<user-id>/drive`
+- `groups/<group-id>/drive`
+- `sites/<site-id>/drive`
+
+The daemon canonicalizes that selector and binds the persisted local index to
+the resolved drive identity. Switching the selector or signed-in account in an
+existing state directory forces a fresh crawl instead of reusing stale delta
+links or search metadata from the previous drive.
 
 ### 4. Mount with davfs2
 

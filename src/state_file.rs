@@ -108,3 +108,10 @@ pub fn rename(dir: &Descriptor, from: &str, to: &str) -> Result<(), String> {
     dir.rename_at(from, dir, to)
         .map_err(|e| format!("failed renaming {from} -> {to}: {e:?}"))
 }
+
+pub fn remove_file(dir: &Descriptor, name: &str) -> Result<(), String> {
+    match dir.unlink_file_at(name) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(format!("failed removing {name}: {e:?}")),
+    }
+}

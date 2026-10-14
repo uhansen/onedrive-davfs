@@ -47,6 +47,7 @@ const GUEST_ENV_NAMES: &[&str] = &[
     "ONEDRIVE_CLIENT_ID",
     "ONEDRIVE_TENANT_ID",
     "ONEDRIVE_DRIVE_BASE",
+    "ONEDRIVE_SCOPES",
     "ONEDRIVE_BASIC_AUTH_SECRET",
     "ONEDRIVE_INDEX_ENABLED",
     "ONEDRIVE_SYNC_MAX_PAGES",
@@ -70,15 +71,21 @@ impl HostConfig {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--component" => {
-                    let value = args.next().ok_or_else(|| anyhow!("missing value for --component"))?;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("missing value for --component"))?;
                     component_path = Some(PathBuf::from(value));
                 }
                 "--state-dir" => {
-                    let value = args.next().ok_or_else(|| anyhow!("missing value for --state-dir"))?;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("missing value for --state-dir"))?;
                     state_dir = Some(PathBuf::from(value));
                 }
                 "--addr" => {
-                    let value = args.next().ok_or_else(|| anyhow!("missing value for --addr"))?;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("missing value for --addr"))?;
                     listen_addr = value
                         .parse()
                         .with_context(|| format!("invalid --addr value: {value}"))?;
@@ -93,13 +100,20 @@ impl HostConfig {
             }
         }
 
-        let component_path = component_path.ok_or_else(|| anyhow!("missing required --component"))?;
+        let component_path =
+            component_path.ok_or_else(|| anyhow!("missing required --component"))?;
         let state_dir = state_dir.ok_or_else(|| anyhow!("missing required --state-dir"))?;
         if !component_path.is_file() {
-            bail!("component does not exist or is not a file: {}", component_path.display());
+            bail!(
+                "component does not exist or is not a file: {}",
+                component_path.display()
+            );
         }
         if !state_dir.is_dir() {
-            bail!("state dir does not exist or is not a directory: {}", state_dir.display());
+            bail!(
+                "state dir does not exist or is not a directory: {}",
+                state_dir.display()
+            );
         }
 
         Ok(Self {
@@ -139,7 +153,9 @@ impl OutboundPolicy {
             return Err(WasiHttpError::HttpRequestDenied);
         }
 
-        let authority = uri.authority().ok_or(WasiHttpError::HttpRequestUriInvalid)?;
+        let authority = uri
+            .authority()
+            .ok_or(WasiHttpError::HttpRequestUriInvalid)?;
         let authority_text = authority.as_str();
         if authority_text.contains('@') {
             return Err(WasiHttpError::HttpRequestDenied);
@@ -260,10 +276,12 @@ impl WasiHttpHooks for HttpPolicyHooks {
         };
         _ = fut;
         Box::new(async move {
-            let (response, io) = send_restricted_request(policy, request, effective_options).await?;
+            let (response, io) =
+                send_restricted_request(policy, request, effective_options).await?;
             Ok((
                 response,
-                Box::new(io) as Box<dyn Future<Output = std::result::Result<(), WasiHttpError>> + Send>,
+                Box::new(io)
+                    as Box<dyn Future<Output = std::result::Result<(), WasiHttpError>> + Send>,
             ))
         })
     }
@@ -282,9 +300,7 @@ async fn send_restricted_request(
 > {
     let validated = policy.validate_uri(req.uri())?;
 
-    let connect_timeout = options
-        .connect_timeout
-        .unwrap_or(OUTBOUND_CONNECT_TIMEOUT);
+    let connect_timeout = options.connect_timeout.unwrap_or(OUTBOUND_CONNECT_TIMEOUT);
     let first_byte_timeout = options
         .first_byte_timeout
         .unwrap_or(OUTBOUND_FIRST_BYTE_TIMEOUT);
@@ -292,9 +308,11 @@ async fn send_restricted_request(
         .between_bytes_timeout
         .unwrap_or(OUTBOUND_BETWEEN_BYTES_TIMEOUT);
 
-    let connect_addr = resolve_public_addr(&validated.host, validated.port, connect_timeout).await?;
+    let connect_addr =
+        resolve_public_addr(&validated.host, validated.port, connect_timeout).await?;
 
-    let stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(connect_addr)).await {
+    let stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(connect_addr)).await
+    {
         Ok(stream) => stream.map_err(WasiHttpError::Connect)?,
         Err(..) => return Err(WasiHttpError::ConnectionTimeout),
     };
@@ -343,7 +361,9 @@ async fn send_restricted_request(
             fn poll_frame(
                 mut self: Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            ) -> std::task::Poll<
+                Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>,
+            > {
                 match Pin::new(&mut self.as_mut().incoming).poll_frame(cx) {
                     std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
                     std::task::Poll::Ready(Some(Err(err))) => {
@@ -358,14 +378,12 @@ async fn send_restricted_request(
                         self.timeout.reset();
                         std::task::Poll::Ready(Some(Ok(frame)))
                     }
-                    std::task::Poll::Pending => {
-                        match Pin::new(&mut self.timeout).poll_tick(cx) {
-                            std::task::Poll::Ready(_) => {
-                                std::task::Poll::Ready(Some(Err(WasiHttpError::ConnectionReadTimeout)))
-                            }
-                            std::task::Poll::Pending => std::task::Poll::Pending,
+                    std::task::Poll::Pending => match Pin::new(&mut self.timeout).poll_tick(cx) {
+                        std::task::Poll::Ready(_) => {
+                            std::task::Poll::Ready(Some(Err(WasiHttpError::ConnectionReadTimeout)))
                         }
-                    }
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    },
                 }
             }
 
@@ -407,22 +425,21 @@ async fn send_restricted_request(
             };
             match Pin::new(fut).poll(cx) {
                 std::task::Poll::Ready(Ok(())) => send.as_mut().poll(cx),
-                std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(WasiHttpError::from(err))),
+                std::task::Poll::Ready(Err(err)) => {
+                    std::task::Poll::Ready(Err(WasiHttpError::from(err)))
+                }
                 std::task::Poll::Pending => std::task::Poll::Pending,
             }
         }
     })
     .await?;
 
-    Ok((
-        response,
-        async move {
-            if let Some(conn) = conn.take() {
-                conn.await.map_err(WasiHttpError::from)?;
-            }
-            Ok(())
-        },
-    ))
+    Ok((response, async move {
+        if let Some(conn) = conn.take() {
+            conn.await.map_err(WasiHttpError::from)?;
+        }
+        Ok(())
+    }))
 }
 
 async fn resolve_public_addr(
@@ -491,7 +508,12 @@ struct HostServer {
 }
 
 impl HostServer {
-    fn new(pre: ProxyPre<HostState>, engine: Engine, config: HostConfig, guest_env: GuestEnv) -> Self {
+    fn new(
+        pre: ProxyPre<HostState>,
+        engine: Engine,
+        config: HostConfig,
+        guest_env: GuestEnv,
+    ) -> Self {
         Self {
             pre,
             engine,
@@ -570,7 +592,12 @@ impl HostServer {
     ) -> Result<Response<HyperOutgoingBody>> {
         let admission = match self.admit().await {
             Ok(admission) => admission,
-            Err(_) => return Ok(plain_response(StatusCode::SERVICE_UNAVAILABLE, "request queue full")),
+            Err(_) => {
+                return Ok(plain_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "request queue full",
+                ));
+            }
         };
 
         let mut store = self.build_store()?;
@@ -618,7 +645,10 @@ impl HostServer {
                 )),
                 Ok(Err(err)) => {
                     warn!("guest request failed: {err:#}");
-                    Ok(plain_response(StatusCode::BAD_GATEWAY, "guest request failed"))
+                    Ok(plain_response(
+                        StatusCode::BAD_GATEWAY,
+                        "guest request failed",
+                    ))
                 }
                 Err(err) => {
                     warn!("guest task join failed: {err}");
@@ -682,7 +712,8 @@ async fn epoch_ticker(engine: Engine) {
 async fn shutdown_signal() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut sigterm = signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = sigterm.recv() => Ok(()),
@@ -698,6 +729,7 @@ async fn shutdown_signal() -> Result<()> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -710,7 +742,12 @@ async fn main() -> Result<()> {
     let engine = build_engine()?;
     let pre = load_pre(&engine, &config.component_path).await?;
     let guest_env = GuestEnv::capture();
-    let server = Arc::new(HostServer::new(pre, engine.clone(), config.clone(), guest_env));
+    let server = Arc::new(HostServer::new(
+        pre,
+        engine.clone(),
+        config.clone(),
+        guest_env,
+    ));
     let listener = TcpListener::bind(config.listen_addr)
         .await
         .with_context(|| format!("failed to bind {}", config.listen_addr))?;

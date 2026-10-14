@@ -3,9 +3,25 @@
 //! Graph delta items are keyed by item id. A move is a reparent; descendant
 //! paths are derived by walking parents, never stored.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 
 pub type Id = String;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveBinding {
+    pub tenant_id: String,
+    pub drive_base: String,
+    pub drive_id: String,
+    #[serde(default)]
+    pub drive_name: String,
+    #[serde(default)]
+    pub drive_type: String,
+    #[serde(default)]
+    pub web_url: String,
+    #[serde(default)]
+    pub owner_label: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemMeta {
@@ -27,6 +43,7 @@ pub struct Index {
     pub nodes: HashMap<Id, Node>,
     pub kids: HashMap<Id, BTreeSet<(String, Id)>>,
     pub root: Option<Id>,
+    pub binding: Option<DriveBinding>,
     pub delta_token: Option<String>,
     pub pending_next_link: Option<String>,
     pub crawl_complete: bool,

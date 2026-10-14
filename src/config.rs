@@ -14,6 +14,7 @@ pub struct Config {
     pub client_id: Option<String>,
     pub tenant_id: String,
     pub drive_base: String,
+    pub auth_scopes: String,
     pub basic_auth_secret: Option<String>,
     /// Preopened directory used to persist `token.json`. Must be granted to
     /// the component via `wasmtime serve --dir <path>::/state`.
@@ -24,6 +25,8 @@ pub struct Config {
     pub sync_max_pages: usize,
     pub sync_budget_ms: u64,
 }
+
+pub const DEFAULT_AUTH_SCOPES: &str = "offline_access Files.ReadWrite.All User.Read";
 
 fn env(name: &str) -> Option<String> {
     environment::get_environment()
@@ -39,7 +42,14 @@ impl Config {
     pub fn load() -> Result<Self, String> {
         let client_id = env("ONEDRIVE_CLIENT_ID");
         let tenant_id = env("ONEDRIVE_TENANT_ID").unwrap_or_else(|| "common".to_string());
-        let drive_base = env("ONEDRIVE_DRIVE_BASE").unwrap_or_else(|| "me/drive".to_string());
+        let drive_base = normalize_drive_base(
+            &env("ONEDRIVE_DRIVE_BASE").unwrap_or_else(|| "me/drive".to_string()),
+        )?;
+        let auth_scopes = normalize_auth_scopes(
+            env("ONEDRIVE_SCOPES")
+                .as_deref()
+                .unwrap_or(DEFAULT_AUTH_SCOPES),
+        )?;
         let basic_auth_secret = validate_basic_auth_secret(
             env("ONEDRIVE_BASIC_AUTH_SECRET"),
             env("ONEDRIVE_ALLOW_UNAUTHENTICATED").as_deref() == Some("1"),
@@ -71,6 +81,7 @@ impl Config {
             client_id,
             tenant_id,
             drive_base,
+            auth_scopes,
             basic_auth_secret,
             state_dir,
             index_enabled,
@@ -78,6 +89,58 @@ impl Config {
             sync_budget_ms,
         })
     }
+}
+
+fn normalize_auth_scopes(raw: &str) -> Result<String, String> {
+    let scopes = raw
+        .split_whitespace()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    if scopes.is_empty() {
+        return Err("ONEDRIVE_SCOPES must contain at least one OAuth scope".to_string());
+    }
+    Ok(scopes.join(" "))
+}
+
+pub fn normalize_drive_base(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("me/drive") {
+        return Ok("me/drive".to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("drives/") {
+        validate_selector_id(rest, "drive id")?;
+        return Ok(format!("drives/{rest}"));
+    }
+    for prefix in ["users", "groups", "sites"] {
+        let head = format!("{prefix}/");
+        if let Some(rest) = trimmed.strip_prefix(&head) {
+            let Some(id) = rest.strip_suffix("/drive") else {
+                return Err(format!(
+                    "unsupported ONEDRIVE_DRIVE_BASE selector {trimmed:?}; expected {prefix}/<id>/drive"
+                ));
+            };
+            validate_selector_id(id, &format!("{prefix} selector id"))?;
+            return Ok(format!("{prefix}/{id}/drive"));
+        }
+    }
+    validate_selector_id(trimmed, "drive id")?;
+    Ok(format!("drives/{trimmed}"))
+}
+
+fn validate_selector_id(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(format!("{label} must not contain path separators"));
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '?' | '#'))
+    {
+        return Err(format!("{label} contains unsupported characters"));
+    }
+    Ok(())
 }
 
 /// Minimum accepted length for the shared Basic-auth secret.
@@ -143,5 +206,33 @@ mod tests {
             validate_basic_auth_secret(Some(s.into()), false).unwrap(),
             Some(s.to_string())
         );
+    }
+
+    #[test]
+    fn drive_base_is_normalized_and_validated() {
+        assert_eq!(normalize_drive_base("me/drive").unwrap(), "me/drive");
+        assert_eq!(
+            normalize_drive_base("/drives/B087983F641B9ED3/").unwrap(),
+            "drives/B087983F641B9ED3"
+        );
+        assert_eq!(
+            normalize_drive_base("users/alice@example.com/drive").unwrap(),
+            "users/alice@example.com/drive"
+        );
+        assert_eq!(
+            normalize_drive_base("sites/tenant.sharepoint.com,abc,def/drive").unwrap(),
+            "sites/tenant.sharepoint.com,abc,def/drive"
+        );
+        assert!(normalize_drive_base("users/alice/drive/root").is_err());
+        assert!(normalize_drive_base("../bad").is_err());
+    }
+
+    #[test]
+    fn auth_scopes_are_normalized() {
+        assert_eq!(
+            normalize_auth_scopes(" offline_access   Files.ReadWrite.All  User.Read ").unwrap(),
+            "offline_access Files.ReadWrite.All User.Read"
+        );
+        assert!(normalize_auth_scopes("   ").is_err());
     }
 }

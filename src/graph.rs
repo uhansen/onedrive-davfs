@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::bindings::wasi::http::types::Method;
 use crate::config::Config;
 use crate::http_client::{self, HttpRequest};
-use crate::index::{DeltaItem, ItemMeta};
+use crate::index::{DeltaItem, DriveBinding, ItemMeta};
 
 /// Graph's simple (non-chunked) upload only supports files up to ~4 MiB.
 /// Larger files go through `createUploadSession` + chunked `Content-Range`.
@@ -68,6 +68,22 @@ struct ParentRef {
 }
 
 #[derive(Deserialize)]
+struct IdentitySet {
+    #[serde(default)]
+    user: Option<Identity>,
+    #[serde(default)]
+    application: Option<Identity>,
+}
+
+#[derive(Deserialize)]
+struct Identity {
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+    #[serde(rename = "userPrincipalName", default)]
+    user_principal_name: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct FileFacet {
     #[serde(rename = "mimeType", default)]
     mime_type: Option<String>,
@@ -78,6 +94,64 @@ struct DriveItemPage {
     value: Vec<DriveItem>,
     #[serde(rename = "@odata.nextLink", default)]
     next_link: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryInfo {
+    pub selector: String,
+    pub drive_id: String,
+    pub drive_name: String,
+    pub drive_type: String,
+    pub web_url: String,
+    pub owner_label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedSite {
+    pub id: String,
+    pub display_name: String,
+    pub web_url: String,
+    pub hostname: String,
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+struct DriveResource {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "driveType", default)]
+    drive_type: String,
+    #[serde(rename = "webUrl", default)]
+    web_url: String,
+    #[serde(default)]
+    owner: Option<IdentitySet>,
+    #[serde(rename = "createdBy", default)]
+    created_by: Option<IdentitySet>,
+}
+
+#[derive(Deserialize)]
+struct DriveResourcePage {
+    value: Vec<DriveResource>,
+    #[serde(rename = "@odata.nextLink", default)]
+    next_link: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SiteResource {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "displayName", default)]
+    display_name: String,
+    #[serde(rename = "webUrl", default)]
+    web_url: String,
+}
+
+pub enum LibraryScope<'a> {
+    Me,
+    Group(&'a str),
+    Site(&'a str),
 }
 
 /// Converts an ISO-8601 Graph timestamp (`"2026-01-12T08:30:00Z"`) to Unix
@@ -108,12 +182,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 fn drive_root_segment(drive_base: &str) -> String {
-    let trimmed = drive_base.trim_matches('/');
-    if trimmed.contains('/') {
-        format!("/{trimmed}")
-    } else {
-        format!("/drives/{trimmed}")
-    }
+    format!("/{}", drive_base.trim_matches('/'))
 }
 
 /// Graph `parentReference.path` uses `/<drive>/root:` for the drive root
@@ -217,6 +286,166 @@ fn to_delta_item(item: &DriveItem) -> Option<DeltaItem> {
             etag: item.etag.clone().unwrap_or_default(),
         },
     })
+}
+
+fn owner_label(sets: &[Option<IdentitySet>]) -> String {
+    for set in sets.iter().flatten() {
+        for identity in [set.user.as_ref(), set.application.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = identity.display_name.as_deref().filter(|s| !s.is_empty()) {
+                return name.to_string();
+            }
+            if let Some(upn) = identity
+                .user_principal_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+            {
+                return upn.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn library_info(drive: DriveResource) -> Option<LibraryInfo> {
+    if drive.id.is_empty() {
+        return None;
+    }
+    Some(LibraryInfo {
+        selector: format!("drives/{}", drive.id),
+        drive_id: drive.id,
+        drive_name: drive.name,
+        drive_type: drive.drive_type,
+        web_url: drive.web_url,
+        owner_label: owner_label(&[drive.owner, drive.created_by]),
+    })
+}
+
+pub fn current_drive_binding(config: &Config) -> Result<DriveBinding, String> {
+    let url = format!(
+        "https://graph.microsoft.com/v1.0{}?$select=id,name,driveType,webUrl,owner,createdBy",
+        drive_root_segment(&config.drive_base)
+    );
+    let response = graph_request(config, Method::Get, &url, None, &[])?;
+    if response.status != 200 {
+        return Err(format!(
+            "graph drive metadata failed with status {}: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        ));
+    }
+    let drive: DriveResource = serde_json::from_slice(&response.body)
+        .map_err(|e| format!("failed to parse drive metadata: {e}"))?;
+    let info = library_info(drive).ok_or_else(|| "drive metadata missing id".to_string())?;
+    Ok(DriveBinding {
+        tenant_id: config.tenant_id.clone(),
+        drive_base: config.drive_base.clone(),
+        drive_id: info.drive_id,
+        drive_name: info.drive_name,
+        drive_type: info.drive_type,
+        web_url: info.web_url,
+        owner_label: info.owner_label,
+    })
+}
+
+fn encoded_segment(value: &str) -> String {
+    crate::xml::pct_encode(value)
+}
+
+fn library_list_url(scope: LibraryScope<'_>) -> String {
+    match scope {
+        LibraryScope::Me => "https://graph.microsoft.com/v1.0/me/drives?$select=id,name,driveType,webUrl,owner,createdBy&$top=100".to_string(),
+        LibraryScope::Group(group_id) => format!(
+            "https://graph.microsoft.com/v1.0/groups/{}/drives?$select=id,name,driveType,webUrl,owner,createdBy&$top=100",
+            encoded_segment(group_id)
+        ),
+        LibraryScope::Site(site_id) => format!(
+            "https://graph.microsoft.com/v1.0/sites/{}/drives?$select=id,name,driveType,webUrl,owner,createdBy&$top=100",
+            encoded_segment(site_id)
+        ),
+    }
+}
+
+pub fn list_libraries(
+    config: &Config,
+    scope: LibraryScope<'_>,
+) -> Result<Vec<LibraryInfo>, String> {
+    let mut url = library_list_url(scope);
+    let mut libraries = Vec::new();
+    let mut pages = 0usize;
+    loop {
+        let response = graph_request(config, Method::Get, &url, None, &[])?;
+        if response.status != 200 {
+            return Err(format!(
+                "graph library discovery failed with status {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ));
+        }
+        let page: DriveResourcePage = serde_json::from_slice(&response.body)
+            .map_err(|e| format!("failed to parse library discovery response: {e}"))?;
+        libraries.extend(page.value.into_iter().filter_map(library_info));
+        pages += 1;
+        match page.next_link {
+            Some(next) => url = validate_next_link(&next, pages)?,
+            None => break,
+        }
+    }
+    libraries.sort_by(|a, b| {
+        a.drive_name
+            .cmp(&b.drive_name)
+            .then_with(|| a.drive_id.cmp(&b.drive_id))
+    });
+    Ok(libraries)
+}
+
+pub fn resolve_site_by_url(config: &Config, site_url: &str) -> Result<ResolvedSite, String> {
+    let (host, path) = parse_sharepoint_site_url(site_url)?;
+    let url = format!(
+        "https://graph.microsoft.com/v1.0/sites/{}:{}?$select=id,displayName,webUrl",
+        encoded_segment(&host),
+        path
+    );
+    let response = graph_request(config, Method::Get, &url, None, &[])?;
+    if response.status != 200 {
+        return Err(format!(
+            "graph site resolve failed with status {}: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        ));
+    }
+    let site: SiteResource = serde_json::from_slice(&response.body)
+        .map_err(|e| format!("failed to parse site metadata: {e}"))?;
+    if site.id.is_empty() {
+        return Err("resolved site metadata missing id".to_string());
+    }
+    Ok(ResolvedSite {
+        id: site.id,
+        display_name: site.display_name,
+        web_url: site.web_url,
+        hostname: host,
+        path,
+    })
+}
+
+fn parse_sharepoint_site_url(site_url: &str) -> Result<(String, String), String> {
+    let raw = site_url.trim();
+    let without_scheme = raw
+        .strip_prefix("https://")
+        .ok_or_else(|| "siteUrl must start with https://".to_string())?;
+    let (host, path_with_rest) = without_scheme
+        .split_once('/')
+        .ok_or_else(|| "siteUrl must include a SharePoint site path".to_string())?;
+    if !(host.ends_with(".sharepoint.com") || host.ends_with(".sharepoint-df.com")) {
+        return Err("siteUrl must target a sharepoint.com or sharepoint-df.com host".to_string());
+    }
+    let path = format!("/{}", path_with_rest.split(['?', '#']).next().unwrap_or(""));
+    if path == "/" {
+        return Err("siteUrl must include a concrete site path".to_string());
+    }
+    Ok((host.to_string(), path))
 }
 
 pub struct DeltaPage {
@@ -699,7 +928,7 @@ mod tests {
     #[test]
     fn drive_root_segment_supports_explicit_drive_id() {
         assert_eq!(
-            drive_root_segment("B087983F641B9ED3"),
+            drive_root_segment("drives/B087983F641B9ED3"),
             "/drives/B087983F641B9ED3"
         );
     }
@@ -746,7 +975,7 @@ mod tests {
         );
         assert_eq!(parent_reference_path("me/drive", "/"), "/me/drive/root:");
         assert_eq!(
-            parent_reference_path("B087983F641B9ED3", "/Documents"),
+            parent_reference_path("drives/B087983F641B9ED3", "/Documents"),
             "/drives/B087983F641B9ED3/root:/Documents"
         );
     }
@@ -789,5 +1018,33 @@ mod tests {
             br#"{"error":{"code":"resyncRequired","message":"go again"}}"#
         ));
         assert!(!is_resync(400, br#"{"error":{"code":"invalidRequest"}}"#));
+    }
+
+    #[test]
+    fn parses_sharepoint_site_urls() {
+        assert_eq!(
+            parse_sharepoint_site_url("https://tenant.sharepoint.com/sites/Engineering").unwrap(),
+            (
+                "tenant.sharepoint.com".to_string(),
+                "/sites/Engineering".to_string()
+            )
+        );
+        assert!(parse_sharepoint_site_url("http://tenant.sharepoint.com/sites/x").is_err());
+        assert!(parse_sharepoint_site_url("https://example.com/sites/x").is_err());
+    }
+
+    #[test]
+    fn owner_label_prefers_display_name() {
+        let label = owner_label(&[
+            Some(IdentitySet {
+                user: Some(Identity {
+                    display_name: Some("Ada Lovelace".into()),
+                    user_principal_name: Some("ada@example.com".into()),
+                }),
+                application: None,
+            }),
+            None,
+        ]);
+        assert_eq!(label, "Ada Lovelace");
     }
 }

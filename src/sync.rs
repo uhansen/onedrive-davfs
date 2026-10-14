@@ -5,7 +5,7 @@
 use crate::config::Config;
 use crate::dav::DavResponse;
 use crate::graph::{self, DeltaError};
-use crate::index::Index;
+use crate::index::{DriveBinding, Index};
 use crate::snapshot::{self, INDEX_FILE, REBUILD_FILE};
 use crate::state_file;
 use crate::sync_stats::{self, SyncStats};
@@ -46,15 +46,44 @@ fn now_ms() -> u64 {
 
 fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
     let started = now_ms();
-    let live = snapshot::load(&config.state_dir, INDEX_FILE)?.unwrap_or_default();
+    let current_binding = graph::current_drive_binding(config)?;
+    let live = snapshot::load(&config.state_dir, INDEX_FILE)?;
     let rebuild = snapshot::load(&config.state_dir, REBUILD_FILE)?;
+    let live_meta = snapshot::read_meta(&config.state_dir)?;
+
+    let binding_changed = existing_binding_mismatch(live_meta.as_ref(), &current_binding)
+        || (live.is_none() && rebuild.is_some());
+    let live = if binding_changed {
+        let generation = live
+            .as_ref()
+            .map(|idx| idx.generation)
+            .into_iter()
+            .chain(rebuild.as_ref().map(|idx| idx.generation))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let idx = Index {
+            binding: Some(current_binding.clone()),
+            generation,
+            ..Index::default()
+        };
+        snapshot::save(&config.state_dir, INDEX_FILE, &idx)?;
+        let _ = state_file::remove_file(&config.state_dir, REBUILD_FILE);
+        Some(idx)
+    } else {
+        live
+    };
+    let rebuild = if binding_changed { None } else { rebuild };
 
     let mut target = if rebuild.is_some() {
         REBUILD_FILE
     } else {
         INDEX_FILE
     };
-    let mut idx = rebuild.unwrap_or(live);
+    let mut idx = rebuild.or(live).unwrap_or_default();
+    if idx.binding.as_ref() != Some(&current_binding) {
+        idx.binding = Some(current_binding.clone());
+    }
     let mut url = idx
         .pending_next_link
         .clone()
@@ -118,6 +147,7 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
                 pages += 1;
                 let generation = idx.generation.saturating_add(1);
                 idx = Index {
+                    binding: Some(current_binding.clone()),
                     generation,
                     ..Index::default()
                 };
@@ -172,11 +202,34 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
         "pages": pages,
         "complete": complete,
         "has_token": idx.delta_token.is_some(),
+        "bindingReset": binding_changed,
+        "drive": {
+            "tenantId": current_binding.tenant_id,
+            "selector": current_binding.drive_base,
+            "id": current_binding.drive_id,
+            "name": current_binding.drive_name,
+            "type": current_binding.drive_type,
+            "webUrl": current_binding.web_url,
+            "owner": current_binding.owner_label,
+        },
         "duration_ms": duration_ms,
         "resync": resync,
         "target": target,
         "items_per_sec": items_per_sec,
     }))
+}
+
+fn existing_binding_mismatch(
+    meta: Option<&snapshot::SnapshotMeta>,
+    current: &DriveBinding,
+) -> bool {
+    match meta {
+        None => false,
+        Some(meta) => match meta.binding.as_ref() {
+            Some(saved) => saved != current,
+            None => true,
+        },
+    }
 }
 
 fn now_secs() -> u64 {
@@ -209,5 +262,36 @@ mod tests {
         assert_eq!(next.generation, 5);
         assert!(next.nodes.is_empty());
         assert!(next.root.is_none());
+    }
+
+    #[test]
+    fn legacy_or_changed_binding_triggers_rebuild() {
+        let current = DriveBinding {
+            tenant_id: "common".into(),
+            drive_base: "me/drive".into(),
+            drive_id: "drive-a".into(),
+            drive_name: "Docs".into(),
+            drive_type: "business".into(),
+            web_url: String::new(),
+            owner_label: String::new(),
+        };
+        let legacy = snapshot::SnapshotMeta {
+            binding: None,
+            delta_token: None,
+            pending_next_link: None,
+            crawl_complete: true,
+            generation: 1,
+            built_at: 1,
+            root_id: None,
+            total_dirs: 0,
+            total_files: 0,
+        };
+        assert!(existing_binding_mismatch(Some(&legacy), &current));
+
+        let same = snapshot::SnapshotMeta {
+            binding: Some(current.clone()),
+            ..legacy.clone()
+        };
+        assert!(!existing_binding_mismatch(Some(&same), &current));
     }
 }

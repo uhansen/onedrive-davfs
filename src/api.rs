@@ -47,6 +47,17 @@ pub fn status(config: &Config) -> DavResponse {
         body["totalDirs"] = serde_json::json!(meta.total_dirs);
         body["totalFiles"] = serde_json::json!(meta.total_files);
         body["pendingNextLink"] = serde_json::json!(meta.pending_next_link.is_some());
+        if let Some(binding) = meta.binding {
+            body["drive"] = serde_json::json!({
+                "tenantId": binding.tenant_id,
+                "selector": binding.drive_base,
+                "id": binding.drive_id,
+                "name": binding.drive_name,
+                "type": binding.drive_type,
+                "webUrl": binding.web_url,
+                "owner": binding.owner_label,
+            });
+        }
     }
     if let Some(tick) = last_tick {
         body["lastTick"] = serde_json::json!({
@@ -60,6 +71,83 @@ pub fn status(config: &Config) -> DavResponse {
         });
     }
     json_ok(body)
+}
+
+pub fn libraries(config: &Config, query: Option<&str>) -> DavResponse {
+    let group_id = query_param(query, "groupId");
+    let site_id = query_param(query, "siteId");
+    let site_url = query_param(query, "siteUrl");
+
+    let scope_count = group_id.is_some() as u8 + site_id.is_some() as u8 + site_url.is_some() as u8;
+    if scope_count > 1 {
+        return json_ok(serde_json::json!({
+            "ok": false,
+            "error": "specify at most one of groupId, siteId, or siteUrl",
+        }));
+    }
+
+    let (scope_name, resolved_site, libraries) = if let Some(group_id) = group_id.as_deref() {
+        (
+            "group",
+            None,
+            graph::list_libraries(config, graph::LibraryScope::Group(group_id)),
+        )
+    } else if let Some(site_id) = site_id.as_deref() {
+        (
+            "site",
+            None,
+            graph::list_libraries(config, graph::LibraryScope::Site(site_id)),
+        )
+    } else if let Some(site_url) = site_url.as_deref() {
+        match graph::resolve_site_by_url(config, site_url) {
+            Ok(site) => {
+                let site_id = site.id.clone();
+                (
+                    "siteUrl",
+                    Some(site),
+                    graph::list_libraries(config, graph::LibraryScope::Site(&site_id)),
+                )
+            }
+            Err(error) => {
+                return json_ok(serde_json::json!({
+                    "ok": false,
+                    "error": error,
+                }));
+            }
+        }
+    } else {
+        (
+            "me",
+            None,
+            graph::list_libraries(config, graph::LibraryScope::Me),
+        )
+    };
+
+    match libraries {
+        Ok(libraries) => json_ok(serde_json::json!({
+            "ok": true,
+            "scope": scope_name,
+            "resolvedSite": resolved_site.as_ref().map(|site| serde_json::json!({
+                "id": site.id,
+                "displayName": site.display_name,
+                "webUrl": site.web_url,
+                "hostname": site.hostname,
+                "path": site.path,
+            })),
+            "libraries": libraries.into_iter().map(|library| serde_json::json!({
+                "selector": library.selector,
+                "id": library.drive_id,
+                "name": library.drive_name,
+                "type": library.drive_type,
+                "webUrl": library.web_url,
+                "owner": library.owner_label,
+            })).collect::<Vec<_>>(),
+        })),
+        Err(error) => json_ok(serde_json::json!({
+            "ok": false,
+            "error": error,
+        })),
+    }
 }
 
 const SEARCH_MAX_RESULTS: usize = 100;
@@ -421,5 +509,17 @@ mod tests {
         let idx = sample_index();
         let out = search_index(&idx, "report");
         assert_eq!(out["truncated"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn query_param_reads_site_url() {
+        assert_eq!(
+            query_param(
+                Some("siteUrl=https%3A%2F%2Ftenant.sharepoint.com%2Fsites%2FEngineering"),
+                "siteUrl"
+            )
+            .as_deref(),
+            Some("https://tenant.sharepoint.com/sites/Engineering")
+        );
     }
 }
