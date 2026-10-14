@@ -7,7 +7,6 @@ component, from Azure app registration to a mounted `~/OneDrive` directory.
 
 For the normal install path, you only need:
 
-- `wasmtime`
 - `davfs2`
 - `curl`, `bash`, and `python3`
 - optional but recommended: `gh` for provenance verification
@@ -17,12 +16,6 @@ Example on Debian/Ubuntu:
 ```sh
 sudo apt update
 sudo apt install -y davfs2 curl python3 gh
-```
-
-Install `wasmtime` however you normally manage it, then confirm:
-
-```sh
-wasmtime --version
 ```
 
 ## 2. Register an Azure app for OneDrive access
@@ -46,12 +39,12 @@ mount.
    - `User.Read`
 7. Copy the **Application (client) ID**. You will use it as `ONEDRIVE_CLIENT_ID`.
 
-## 3. Download the prebuilt WebAssembly component
+## 3. Download the prebuilt host and WebAssembly component
 
 Create a place to install the downloaded artifact:
 
 ```sh
-install -d ~/.local/share/onedrive-davfs
+install -d ~/.local/share/onedrive-davfs ~/.local/bin
 ```
 
 Set the release tag you want to install:
@@ -60,24 +53,32 @@ Set the release tag you want to install:
 VERSION=v0.1.0
 ```
 
-Download the component and checksum from GitHub Releases:
+Download the host binary, component, and checksums from GitHub Releases:
 
 ```sh
+curl -L -o ~/.local/bin/onedrive-davfs-host \
+  "https://github.com/uhansen/onedrive-davfs/releases/download/${VERSION}/onedrive-davfs-host-x86_64-unknown-linux-gnu"
 curl -L -o ~/.local/share/onedrive-davfs/onedrive_davfs.wasm \
   "https://github.com/uhansen/onedrive-davfs/releases/download/${VERSION}/onedrive_davfs.wasm"
+curl -L -o /tmp/onedrive-davfs-host.sha256 \
+  "https://github.com/uhansen/onedrive-davfs/releases/download/${VERSION}/onedrive-davfs-host-x86_64-unknown-linux-gnu.sha256"
 curl -L -o /tmp/onedrive_davfs.wasm.sha256 \
   "https://github.com/uhansen/onedrive-davfs/releases/download/${VERSION}/onedrive_davfs.wasm.sha256"
 ```
 
-Verify the checksum:
+Verify the checksums:
 
 ```sh
+(cd ~/.local/bin && sha256sum -c /tmp/onedrive-davfs-host.sha256)
 (cd ~/.local/share/onedrive-davfs && sha256sum -c /tmp/onedrive_davfs.wasm.sha256)
+chmod 755 ~/.local/bin/onedrive-davfs-host
 ```
 
 Optional: verify GitHub build provenance:
 
 ```sh
+gh attestation verify ~/.local/bin/onedrive-davfs-host \
+  --repo uhansen/onedrive-davfs
 gh attestation verify ~/.local/share/onedrive-davfs/onedrive_davfs.wasm \
   --repo uhansen/onedrive-davfs
 ```
@@ -101,7 +102,7 @@ Complete the sign-in in a browser and wait for the script to finish.
 ## 5. Install the systemd files
 
 ```sh
-install -d ~/.local/state/onedrive-davfs
+install -d ~/.local/bin ~/.local/state/onedrive-davfs
 install -d ~/.config/systemd/user
 install -m 644 systemd/onedrive-davfs.service ~/.config/systemd/user/
 install -m 644 systemd/onedrive-davfs-mount.service ~/.config/systemd/user/
@@ -155,14 +156,18 @@ systemctl --user enable --now onedrive-davfs.service
 systemctl --user enable --now onedrive-davfs-sync.timer
 ```
 
+`enable --now` both starts the daemon immediately and enables it to launch
+again automatically on future logins/startup.
+
 Check status:
 
 ```sh
 systemctl --user status --no-pager onedrive-davfs.service
 ```
 
-The service runs `wasmtime serve` with `-S cli=y`, exports the configured env
-vars into the guest, and binds the WebDAV endpoint to `127.0.0.1:8765`.
+The service runs `~/.local/bin/onedrive-davfs-host`, forwards only the
+documented OneDrive env vars into the guest, preopens only `/state`, and binds
+the WebDAV endpoint to `127.0.0.1:8765`.
 
 ## 8. Configure `davfs2` credentials
 
@@ -242,6 +247,8 @@ Common causes:
 - `ONEDRIVE_BASIC_AUTH_SECRET` is missing or still set to a placeholder
 - `ONEDRIVE_CLIENT_ID` is missing and the access token must be refreshed
 - the state directory was not exposed to the guest as `/state`
+- the host binary or component was not installed at the paths referenced by
+  `systemd/onedrive-davfs.service`
 
 ### Mount asks for credentials or fails authentication
 

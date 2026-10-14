@@ -1,0 +1,21 @@
+[package]
+name = "onedrive-davfs-host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+bytes = "1.11.0"
+http = "1.3.1"
+http-body = "1.0.1"
+http-body-util = "0.1.3"
+hyper = { version = "1.8.1", features = ["http1", "server", "client"] }
+rustls = "0.23.35"
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = "0.26.4"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+wasmtime = { version = "50.0.0-rc.1", default-features = false, features = ["async", "component-model", "component-model-async", "cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "50.0.0-rc.1", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "50.0.0-rc.1", default-features = false, features = ["p2", "default-send-request"] }
+webpki-roots = "1.0.4"

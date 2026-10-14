@@ -11,6 +11,8 @@ permissions:
 
 env:
   COMPONENT_PATH: target/wasm32-wasip2/release/onedrive_davfs.wasm
+  HOST_MANIFEST: host/Cargo.toml
+  HOST_BINARY_PATH: host/target/release/onedrive-davfs-host
   WASM_TOOLS_VERSION: 1.244.0
 
 jobs:
@@ -36,6 +38,9 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib
 
+      - name: Run host tests
+        run: cargo test --manifest-path "${HOST_MANIFEST}"
+
       - name: Check formatting for handwritten Rust sources
         run: |
           git ls-files '*.rs' \
@@ -45,6 +50,9 @@ jobs:
       - name: Build release component
         run: cargo build --target wasm32-wasip2 --release
 
+      - name: Build native host
+        run: cargo build --manifest-path "${HOST_MANIFEST}" --release
+
       - name: Validate WebAssembly component
         run: wasm-tools validate "${COMPONENT_PATH}"
 
@@ -53,4 +61,11 @@ jobs:
         with:
           name: onedrive_davfs-wasm
           path: ${{ env.COMPONENT_PATH }}
+          if-no-files-found: error
+
+      - name: Upload host artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onedrive-davfs-host-linux-x86_64
+          path: ${{ env.HOST_BINARY_PATH }}
           if-no-files-found: error

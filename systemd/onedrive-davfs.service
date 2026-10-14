@@ -1,9 +1,10 @@
 # onedrive-davfs user unit.
 #
-# Serves the WebDAV component compiled to wasm32-wasip2 via `wasmtime
-# serve`. All OAuth/network I/O happens inside this process (through
-# wasi:http) -- nothing runs as root, and the process only has access to
-# the one preopened state directory below.
+# Serves the WebDAV component compiled to wasm32-wasip2 via the native
+# `onedrive-davfs-host` Wasmtime embedder. All OAuth/network I/O still
+# happens through `wasi:http`, but the host now enforces the guest env/fs
+# capabilities, outbound HTTPS policy, request serialization, and store
+# limits explicitly.
 #
 # Install:
 #   mkdir -p ~/.config/systemd/user
@@ -18,8 +19,9 @@
 #   install -m 600 systemd/onedrive-davfs.env.example ~/.config/onedrive-davfs/env
 #   $EDITOR ~/.config/onedrive-davfs/env
 #
-# NOTE: `wasmtime serve` does NOT inherit the host environment into the
-# guest; each variable must be named with `--env NAME` on ExecStart below.
+# NOTE: the native host does not inherit its whole environment into the
+# guest. It forwards only the documented OneDrive variables below and
+# preopens only the state directory as `/state`.
 #
 # Variables (see onedrive-davfs.env.example):
 #   ONEDRIVE_CLIENT_ID          Azure AD app (client) ID (needed for refresh)
@@ -37,15 +39,16 @@ Wants=network-online.target
 [Service]
 Type=exec
 EnvironmentFile=%h/.config/onedrive-davfs/env
-ExecStart=%h/.local/bin/wasmtime serve \
-    -S cli=y \
-    --env ONEDRIVE_CLIENT_ID --env ONEDRIVE_TENANT_ID \
-    --env ONEDRIVE_DRIVE_BASE --env ONEDRIVE_BASIC_AUTH_SECRET \
-    --env ONEDRIVE_INDEX_ENABLED --env ONEDRIVE_SYNC_MAX_PAGES \
-    --env ONEDRIVE_SYNC_BUDGET_MS \
+ExecStart=%h/.local/bin/onedrive-davfs-host \
     --addr 127.0.0.1:8765 \
-    --dir %h/.local/state/onedrive-davfs::/state \
-    %h/.local/share/onedrive-davfs/onedrive_davfs.wasm
+    --state-dir %h/.local/state/onedrive-davfs \
+    --component %h/.local/share/onedrive-davfs/onedrive_davfs.wasm
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
 Restart=on-failure
 RestartSec=5
 

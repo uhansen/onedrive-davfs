@@ -13,6 +13,10 @@ permissions:
 env:
   COMPONENT_PATH: target/wasm32-wasip2/release/onedrive_davfs.wasm
   CHECKSUM_PATH: target/wasm32-wasip2/release/onedrive_davfs.wasm.sha256
+  HOST_MANIFEST: host/Cargo.toml
+  HOST_BINARY_PATH: host/target/release/onedrive-davfs-host
+  HOST_RELEASE_PATH: host/target/release/onedrive-davfs-host-x86_64-unknown-linux-gnu
+  HOST_CHECKSUM_PATH: host/target/release/onedrive-davfs-host-x86_64-unknown-linux-gnu.sha256
   WASM_TOOLS_VERSION: 1.244.0
 
 jobs:
@@ -38,6 +42,9 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib
 
+      - name: Run host tests
+        run: cargo test --manifest-path "${HOST_MANIFEST}"
+
       - name: Check formatting for handwritten Rust sources
         run: |
           git ls-files '*.rs' \
@@ -47,16 +54,30 @@ jobs:
       - name: Build release component
         run: cargo build --target wasm32-wasip2 --release
 
+      - name: Build native host
+        run: cargo build --manifest-path "${HOST_MANIFEST}" --release
+
       - name: Validate WebAssembly component
         run: wasm-tools validate "${COMPONENT_PATH}"
 
-      - name: Generate SHA256 checksum
+      - name: Stage host release asset
+        run: cp "${HOST_BINARY_PATH}" "${HOST_RELEASE_PATH}"
+
+      - name: Generate SHA256 checksums
         run: sha256sum "${COMPONENT_PATH}" > "${CHECKSUM_PATH}"
 
-      - name: Attest build provenance
+      - name: Generate host SHA256 checksum
+        run: sha256sum "${HOST_RELEASE_PATH}" > "${HOST_CHECKSUM_PATH}"
+
+      - name: Attest Wasm build provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ env.COMPONENT_PATH }}
+
+      - name: Attest host build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.HOST_RELEASE_PATH }}
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
@@ -64,4 +85,6 @@ jobs:
           files: |
             ${{ env.COMPONENT_PATH }}
             ${{ env.CHECKSUM_PATH }}
+            ${{ env.HOST_RELEASE_PATH }}
+            ${{ env.HOST_CHECKSUM_PATH }}
           generate_release_notes: true
