@@ -331,8 +331,26 @@ Unchanged, complete delta cursors can skip full snapshot decode; account and
 drive identity checks still run first. Changed cursors, pending rebuilds,
 legacy metadata or identity changes use the full path.
 
+Successful namespace publications also advance `namespaceRevision` in
+authenticated status. This decimal-string revision is separate from index
+generation and timestamp, so consumers can detect local changes, remote
+changes and multiple updates within one second. Cursor-only updates do not
+advance it; legacy snapshots default to revision zero.
+
+The host persists Graph cooldowns across requests/restarts, coordinating
+libraries using the same account. A throttled response defers later Graph
+requests until its `Retry-After` deadline; absent headers use bounded backoff.
+Cached status remains available and exposes a sanitized `cooldown` object.
+`capabilities.persistedGraphCooldown` lets installers verify this protection
+before enabling aggressive polling. Cooldown expiry is not a successful sync,
+and mutations are not automatically replayed.
+
 The Omarchy plugin's `SETUP.md` documents optional timer/davfs tuning with its
-render-only Bash script; no installed settings are changed automatically.
+render-only Bash entry point and explicit apply/restore operations. Its
+opt-in low-latency preset schedules the next tick after the previous one
+finishes, rather than overlapping requests. No installed settings change
+without explicit application. Transfers still share the serialized mutation
+lane and can delay cloud metadata refresh.
 
 Manual smoke test once a token is in place (the daemon refuses to start
 without a real shared secret, so pass one here too):

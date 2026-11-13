@@ -14,39 +14,45 @@ use crate::xml;
 pub fn status(config: &Config) -> DavResponse {
     let (credential_present, token_expires_in) = match crate::auth::credential_status(config) {
         Ok(status) => status,
-        Err(error) => return json_ok(serde_json::json!({"ok": false, "error": error})),
+        Err(error) => return status_json(config, serde_json::json!({"ok": false, "error": error})),
     };
     let failure = match sync_stats::load_failure(config) {
         Ok(failure) => failure,
-        Err(error) => return json_ok(serde_json::json!({"ok": false, "error": error})),
+        Err(error) => return status_json(config, serde_json::json!({"ok": false, "error": error})),
     };
     if !config.index_enabled {
-        return json_ok(serde_json::json!({
-            "ok": true,
-            "indexEnabled": false,
-            "credentialPresent": credential_present,
-            "tokenExpiresInSec": token_expires_in,
-            "lastSyncError": failure.as_ref().map(|failure| &failure.error),
-            "lastSyncErrorAt": failure.as_ref().map(|failure| failure.at),
-        }));
+        return status_json(
+            config,
+            serde_json::json!({
+                "ok": true,
+                "indexEnabled": false,
+                "credentialPresent": credential_present,
+                "tokenExpiresInSec": token_expires_in,
+                "lastSyncError": failure.as_ref().map(|failure| &failure.error),
+                "lastSyncErrorAt": failure.as_ref().map(|failure| failure.at),
+            }),
+        );
     }
     let meta = match snapshot::read_meta(&config.state_dir) {
         Ok(meta) => meta,
-        Err(error) => return json_ok(serde_json::json!({"ok": false, "error": error})),
+        Err(error) => return status_json(config, serde_json::json!({"ok": false, "error": error})),
     };
     if !config.cache_current() {
-        return json_ok(serde_json::json!({
-            "ok": true,
-            "indexEnabled": true,
-            "present": false,
-            "accessVerified": false,
-            "reindexRequired": true,
-            "crawlComplete": false,
-            "credentialPresent": credential_present,
-            "tokenExpiresInSec": token_expires_in,
-            "lastSyncError": failure.as_ref().map(|failure| &failure.error),
-            "lastSyncErrorAt": failure.as_ref().map(|failure| failure.at),
-        }));
+        return status_json(
+            config,
+            serde_json::json!({
+                "ok": true,
+                "indexEnabled": true,
+                "present": false,
+                "accessVerified": false,
+                "reindexRequired": true,
+                "crawlComplete": false,
+                "credentialPresent": credential_present,
+                "tokenExpiresInSec": token_expires_in,
+                "lastSyncError": failure.as_ref().map(|failure| &failure.error),
+                "lastSyncErrorAt": failure.as_ref().map(|failure| failure.at),
+            }),
+        );
     }
 
     let last_tick = match sync_stats::load(&config.state_dir) {
@@ -55,7 +61,7 @@ pub fn status(config: &Config) -> DavResponse {
                 .and_then(|meta| meta.binding.as_ref())
                 .is_some_and(|binding| tick.matches_binding(binding))
         }),
-        Err(error) => return json_ok(serde_json::json!({"ok": false, "error": error})),
+        Err(error) => return status_json(config, serde_json::json!({"ok": false, "error": error})),
     };
     let rebuilding = last_tick
         .as_ref()
@@ -77,6 +83,7 @@ pub fn status(config: &Config) -> DavResponse {
         body["crawlComplete"] = serde_json::json!(meta.crawl_complete && !rebuilding);
         body["hasToken"] = serde_json::json!(meta.delta_token.is_some());
         body["generation"] = serde_json::json!(meta.generation);
+        body["namespaceRevision"] = serde_json::json!(meta.namespace_revision.to_string());
         body["builtAt"] = serde_json::json!(meta.built_at);
         body["totalDirs"] = serde_json::json!(meta.total_dirs);
         body["totalFiles"] = serde_json::json!(meta.total_files);
@@ -105,7 +112,19 @@ pub fn status(config: &Config) -> DavResponse {
             "at": tick.at,
         });
     }
-    json_ok(body)
+    status_json(config, body)
+}
+
+fn status_json(config: &Config, mut body: serde_json::Value) -> DavResponse {
+    match crate::cooldown::load(config) {
+        Ok(cooldown) => {
+            body["capabilities"] =
+                serde_json::json!({"persistedGraphCooldown": cooldown.is_some()});
+            body["cooldown"] = serde_json::json!(cooldown);
+            json_ok(body)
+        }
+        Err(error) => json_ok(serde_json::json!({"ok": false, "error": error})),
+    }
 }
 
 pub fn libraries(config: &Config, query: Option<&str>) -> DavResponse {

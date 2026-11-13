@@ -27,6 +27,8 @@ pub struct SnapshotMeta {
     pub pending_next_link: Option<String>,
     pub crawl_complete: bool,
     pub generation: u64,
+    #[serde(default)]
+    pub namespace_revision: u64,
     pub built_at: u64,
     pub root_id: Option<String>,
     /// Directory count (including root), baked in at encode time so
@@ -148,6 +150,7 @@ pub fn encode(index: &Index) -> Result<Vec<u8>, String> {
         pending_next_link: index.pending_next_link.clone(),
         crawl_complete: index.crawl_complete,
         generation: index.generation,
+        namespace_revision: index.namespace_revision,
         built_at: now_secs(),
         root_id: index.root.clone(),
         total_dirs: dirs.len() as u64,
@@ -180,6 +183,7 @@ pub fn decode(bytes: &[u8]) -> Result<Index, String> {
         pending_next_link: meta.pending_next_link,
         crawl_complete: meta.crawl_complete,
         generation: meta.generation,
+        namespace_revision: meta.namespace_revision,
         root: meta.root_id,
         ..Index::default()
     };
@@ -293,15 +297,18 @@ pub fn save(dir: &Descriptor, name: &str, index: &Index) -> Result<(), String> {
     state_file::write_atomic(dir, name, &bytes)
 }
 
-/// Patch the live snapshot in place. No-op if it is missing or unreadable.
-pub fn mutate(dir: &Descriptor, f: impl FnOnce(&mut Index) -> bool) {
+/// Patch and atomically publish a new namespace revision.
+pub fn mutate(dir: &Descriptor, f: impl FnOnce(&mut Index) -> bool) -> Result<(), String> {
     let mut idx = match load(dir, INDEX_FILE) {
         Ok(Some(i)) => i,
-        _ => return,
+        Ok(None) => return Err("live index is missing".into()),
+        Err(error) => return Err(error),
     };
     if f(&mut idx) {
-        let _ = save(dir, INDEX_FILE, &idx);
+        idx.advance_namespace()?;
+        save(dir, INDEX_FILE, &idx)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -556,6 +563,30 @@ fn parse_dir_table(data: &[u8], count: u32) -> Result<Vec<DirRow>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revisions_survive_same_second_changes_and_legacy_metadata() {
+        let mut idx = Index::default();
+        idx.apply(root());
+        idx.advance_namespace().unwrap();
+        let bytes = encode(&idx).unwrap();
+        let mut loaded = decode(&bytes).unwrap();
+        assert_eq!(loaded.namespace_revision, 1);
+        loaded.advance_namespace().unwrap();
+        assert_eq!(
+            decode(&encode(&loaded).unwrap())
+                .unwrap()
+                .namespace_revision,
+            2
+        );
+        let meta = serde_json::json!({
+            "binding": null, "delta_token": null, "pending_next_link": null,
+            "crawl_complete": true, "generation": 1, "built_at": 1,
+            "root_id": "r", "total_dirs": 1, "total_files": 0
+        });
+        let legacy: SnapshotMeta = serde_json::from_value(meta).unwrap();
+        assert_eq!(legacy.namespace_revision, 0);
+    }
 
     #[test]
     #[ignore = "isolated representative-index benchmark; run with --release --ignored --nocapture"]

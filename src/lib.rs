@@ -4,6 +4,7 @@ mod bindings;
 mod api;
 mod auth;
 mod config;
+mod cooldown;
 mod dav;
 mod graph;
 mod http_client;

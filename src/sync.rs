@@ -94,6 +94,7 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
                 root: meta.root_id.clone(),
                 delta_token: meta.delta_token.clone(),
                 generation: meta.generation,
+                namespace_revision: meta.namespace_revision,
                 crawl_complete: true,
                 ..Index::default()
             }),
@@ -131,6 +132,13 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
         let idx = Index {
             binding: Some(current_binding.clone()),
             generation,
+            namespace_revision: live
+                .as_ref()
+                .map(|idx| idx.namespace_revision)
+                .into_iter()
+                .chain(rebuild.as_ref().map(|idx| idx.namespace_revision))
+                .max()
+                .unwrap_or(0),
             ..Index::default()
         };
         Some(idx)
@@ -158,6 +166,7 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
     let mut pages = 0usize;
     let mut applied = 0usize;
     let mut dirty = binding_changed || metadata_changed;
+    let mut namespace_changed = binding_changed || metadata_changed;
     if let Some(meta) = live_meta.as_ref() {
         // Snapshots written before total_* / built_at need a one-shot rewrite.
         if meta.built_at == 0 || (meta.total_dirs == 0 && meta.crawl_complete) {
@@ -186,6 +195,7 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
                 pages += 1;
                 if !page.items.is_empty() {
                     dirty = true;
+                    namespace_changed = true;
                 }
                 for it in page.items {
                     idx.apply(it);
@@ -221,12 +231,14 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
             }
             Err(DeltaError::Resync) => {
                 resync = true;
+                namespace_changed = true;
                 dirty = true;
                 pages += 1;
                 let generation = idx.generation.saturating_add(1);
                 idx = Index {
                     binding: Some(current_binding.clone()),
                     generation,
+                    namespace_revision: idx.namespace_revision,
                     ..Index::default()
                 };
                 url = graph::initial_delta_url(&config.drive_base);
@@ -242,6 +254,9 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
 
     let save_started = now_ms();
     if dirty {
+        if namespace_changed {
+            idx.advance_namespace()?;
+        }
         snapshot::save(&config.state_dir, target, &idx)?;
     }
     if binding_changed
@@ -345,6 +360,7 @@ mod tests {
             pending_next_link: None,
             crawl_complete: true,
             generation: 1,
+            namespace_revision: 0,
             built_at: 1,
             root_id: Some("root".into()),
             total_dirs: 1,
@@ -417,6 +433,7 @@ mod tests {
             pending_next_link: None,
             crawl_complete: true,
             generation: 1,
+            namespace_revision: 0,
             built_at: 1,
             root_id: None,
             total_dirs: 0,

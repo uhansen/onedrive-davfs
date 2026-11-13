@@ -260,6 +260,12 @@ fn send_with_read_retry(request: HttpRequest<'_>) -> Result<http_client::HttpRes
         {
             return Ok(response);
         }
+        if response.header_value("x-onedrive-host-cooldown").as_deref() == Some("1") {
+            return Err(format!(
+                "Microsoft Graph is throttled/unavailable (HTTP {}); host cooldown active; retry later",
+                response.status
+            ));
+        }
         let seconds = retry_delay(
             response.header_value("retry-after").as_deref(),
             crate::auth::now_secs(),

@@ -269,11 +269,35 @@ fn head_from_index(config: &Config, path: &str) -> Option<DavResponse> {
     })
 }
 
-fn write_through(config: &Config, f: impl FnOnce(&mut crate::index::Index) -> bool) {
+fn write_through(
+    config: &Config,
+    f: impl FnOnce(&mut crate::index::Index) -> bool,
+) -> Result<(), String> {
     if !config.cache_current() {
-        return;
+        return Ok(());
     }
-    snapshot::mutate(&config.state_dir, f);
+    snapshot::mutate(&config.state_dir, f)
+}
+
+fn mutation_response(config: &Config, update: Result<(), String>, status: u16) -> DavResponse {
+    let mut response = DavResponse::empty(status);
+    if let Err(error) = update {
+        let diagnostic =
+            format!("Cloud mutation succeeded but local metadata publication failed: {error}");
+        let persisted = crate::sync_stats::save_failure(config, &diagnostic).is_ok();
+        response.headers.push((
+            "warning",
+            format!(
+                "199 onedrive-davfs \"Cloud mutation succeeded; local metadata refresh failed{}\"",
+                if persisted {
+                    "; see sync diagnostic"
+                } else {
+                    "; diagnostic persistence also failed"
+                }
+            ),
+        ));
+    }
+    response
 }
 
 fn apply_or_upsert(
@@ -303,7 +327,7 @@ pub fn put(config: &Config, path: &str, body: &crate::upload::Upload) -> DavResp
     }
     match graph::put_content(config, path, body) {
         Ok(item) => {
-            write_through(config, |idx| {
+            let update = write_through(config, |idx| {
                 apply_or_upsert(
                     idx,
                     item,
@@ -316,7 +340,7 @@ pub fn put(config: &Config, path: &str, body: &crate::upload::Upload) -> DavResp
                     },
                 )
             });
-            DavResponse::empty(201)
+            mutation_response(config, update, 201)
         }
         Err(e) => DavResponse::error(502, e),
     }
@@ -331,7 +355,7 @@ pub fn mkcol(config: &Config, path: &str) -> DavResponse {
         .unwrap_or(path);
     match graph::create_folder(config, &parent, name) {
         Ok(item) => {
-            write_through(config, |idx| {
+            let update = write_through(config, |idx| {
                 apply_or_upsert(
                     idx,
                     item,
@@ -344,7 +368,7 @@ pub fn mkcol(config: &Config, path: &str) -> DavResponse {
                     },
                 )
             });
-            DavResponse::empty(201)
+            mutation_response(config, update, 201)
         }
         Err(e) => DavResponse::error(502, e),
     }
@@ -353,8 +377,8 @@ pub fn mkcol(config: &Config, path: &str) -> DavResponse {
 pub fn delete(config: &Config, path: &str) -> DavResponse {
     match graph::delete(config, path) {
         Ok(()) => {
-            write_through(config, |idx| idx.remove_at_path(path));
-            DavResponse::empty(204)
+            let update = write_through(config, |idx| idx.remove_at_path(path));
+            mutation_response(config, update, 204)
         }
         Err(e) => DavResponse::error(502, e),
     }
@@ -365,7 +389,7 @@ pub fn delete(config: &Config, path: &str) -> DavResponse {
 pub fn r#move(config: &Config, path: &str, destination: &str) -> DavResponse {
     match graph::move_or_rename(config, path, destination) {
         Ok(item) => {
-            write_through(config, |idx| {
+            let update = write_through(config, |idx| {
                 if let Some(it) = item {
                     idx.apply(it);
                     if idx.resolve(destination).is_some() {
@@ -374,7 +398,7 @@ pub fn r#move(config: &Config, path: &str, destination: &str) -> DavResponse {
                 }
                 idx.move_at_path(path, destination)
             });
-            DavResponse::empty(201)
+            mutation_response(config, update, 201)
         }
         Err(e) => DavResponse::error(502, e),
     }

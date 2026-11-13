@@ -89,6 +89,28 @@ pub struct CredentialLease {
     guest_token: PathBuf,
 }
 
+fn with_credential_identity(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    let Ok(mut token) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(bytes);
+    };
+    if token
+        .get("credential_id")
+        .and_then(|value| value.as_str())
+        .is_some_and(|id| !id.is_empty())
+    {
+        return Ok(bytes);
+    }
+    let Some(refresh) = token.get("refresh_token").and_then(|value| value.as_str()) else {
+        return Ok(bytes);
+    };
+    // Migrate old token files once under the token lease. The guest preserves
+    // this identity through refresh-token rotation; interactive login replaces it.
+    let identity = format!("legacy-{:x}", Sha256::digest(refresh.as_bytes()));
+    token["credential_id"] = identity.into();
+    Ok(serde_json::to_vec(&token)?)
+}
+
 impl CredentialLease {
     pub async fn acquire(state_dir: &Path, account_dir: Option<&Path>) -> Result<Self> {
         let directory = account_dir.unwrap_or(state_dir);
@@ -115,13 +137,22 @@ impl CredentialLease {
         let guest_token = state_dir.join("token.json");
         if let Some(account_dir) = account_dir {
             Self::recover(account_dir)?;
-            let bytes = std::fs::read(account_dir.join("token.json"))
+            let original = std::fs::read(account_dir.join("token.json"))
                 .context("account credentials missing; sign in to this account first")?;
+            let bytes = with_credential_identity(original.clone())?;
+            if bytes != original {
+                atomic_write(&account_dir.join("token.json"), &bytes)?;
+            }
             atomic_write(&guest_token, &bytes)?;
             atomic_write(
                 &account_dir.join(PENDING),
                 guest_token.as_os_str().as_encoded_bytes(),
             )?;
+        } else if let Ok(original) = std::fs::read(&guest_token) {
+            let bytes = with_credential_identity(original.clone())?;
+            if bytes != original {
+                atomic_write(&guest_token, &bytes)?;
+            }
         }
         Ok(Self {
             _lock: lock,
@@ -179,6 +210,29 @@ pub fn lock_state(state_dir: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_identity_survives_refresh_rotation() {
+        let root = fixture();
+        atomic_write(&root.join("token.json"), br#"{"refresh_token":"initial"}"#).unwrap();
+        let lease = CredentialLease::acquire(&root, None).await.unwrap();
+        let mut token: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("token.json")).unwrap()).unwrap();
+        let identity = token["credential_id"].clone();
+        token["refresh_token"] = "rotated".into();
+        atomic_write(
+            &root.join("token.json"),
+            &serde_json::to_vec(&token).unwrap(),
+        )
+        .unwrap();
+        drop(lease);
+        let lease = CredentialLease::acquire(&root, None).await.unwrap();
+        let token: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("token.json")).unwrap()).unwrap();
+        assert_eq!(token["credential_id"], identity);
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn fixture() -> PathBuf {
         let directory = std::env::current_dir()

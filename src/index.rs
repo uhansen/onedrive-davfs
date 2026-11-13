@@ -80,6 +80,7 @@ pub struct Index {
     pub pending_next_link: Option<String>,
     pub crawl_complete: bool,
     pub generation: u64,
+    pub namespace_revision: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +94,14 @@ pub struct DeltaItem {
 }
 
 impl Index {
+    pub fn advance_namespace(&mut self) -> Result<(), String> {
+        self.namespace_revision = self
+            .namespace_revision
+            .checked_add(1)
+            .ok_or("namespace revision exhausted")?;
+        Ok(())
+    }
+
     pub fn apply(&mut self, it: DeltaItem) {
         if it.id.is_empty() {
             return;

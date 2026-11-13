@@ -29,6 +29,7 @@ use wasmtime_wasi_http::{
     WasiHttpView,
 };
 
+mod cooldown;
 mod credentials;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8765";
@@ -389,6 +390,7 @@ struct HttpPolicyHooks {
     policy: OutboundPolicy,
     read_only: bool,
     client: Arc<OutboundClient>,
+    cooldown: Option<cooldown::Cooldown>,
     #[cfg(test)]
     mock_peer: Option<SocketAddr>,
 }
@@ -399,6 +401,7 @@ impl HttpPolicyHooks {
             policy,
             read_only: false,
             client,
+            cooldown: None,
             #[cfg(test)]
             mock_peer: None,
         }
@@ -429,6 +432,7 @@ impl WasiHttpHooks for HttpPolicyHooks {
         let policy = self.policy.clone();
         let client = self.client.clone();
         let read_only = self.read_only;
+        let cooldown = self.cooldown.clone();
         #[cfg(test)]
         let mock_peer = self.mock_peer;
         let effective_options = RequestOptions {
@@ -447,18 +451,41 @@ impl WasiHttpHooks for HttpPolicyHooks {
             if read_only {
                 return Err(WasiHttpError::HttpRequestDenied);
             }
+            let validated = policy.validate_uri(request.uri())?;
+            if let Some(cooldown) = &cooldown {
+                cooldown
+                    .check()
+                    .map_err(|_| WasiHttpError::HttpRequestDenied)?;
+            }
+            let graph = validated.host == "graph.microsoft.com";
+            let observe =
+                |response: &mut Response<WasiBody>| -> std::result::Result<(), WasiHttpError> {
+                    if graph && let Some(cooldown) = &cooldown {
+                        cooldown
+                            .observe(response.status(), response.headers())
+                            .map_err(|_| WasiHttpError::HttpRequestDenied)?;
+                        if matches!(response.status().as_u16(), 429 | 503) {
+                            response.headers_mut().insert(
+                                "x-onedrive-host-cooldown",
+                                http::HeaderValue::from_static("1"),
+                            );
+                        }
+                    }
+                    Ok(())
+                };
             #[cfg(test)]
             if let Some(peer) = mock_peer {
-                policy.validate_uri(request.uri())?;
-                let (response, io) = tests::send_mock_request(client, peer, request).await?;
+                let (mut response, io) = tests::send_mock_request(client, peer, request).await?;
+                observe(&mut response)?;
                 return Ok((
                     response,
                     Box::new(io)
                         as Box<dyn Future<Output = std::result::Result<(), WasiHttpError>> + Send>,
                 ));
             }
-            let (response, io) =
+            let (mut response, io) =
                 send_restricted_request(client, policy, request, effective_options).await?;
+            observe(&mut response)?;
             Ok((
                 response,
                 Box::new(io)
@@ -885,6 +912,10 @@ impl HostServer {
             .build();
 
         let mut hooks = HttpPolicyHooks::new(OutboundPolicy, self.outbound.clone());
+        let cooldown =
+            cooldown::Cooldown::new(&self.config.state_dir, self.config.account_dir.as_deref());
+        cooldown.refresh()?;
+        hooks.cooldown = Some(cooldown);
         hooks.read_only = read_only;
         #[cfg(test)]
         {
@@ -1134,6 +1165,7 @@ async fn main() -> Result<()> {
     let config = HostConfig::parse()?;
     let _state_owner = credentials::lock_state(&config.state_dir)?;
     let _upload_directory = credentials::prepare_upload_directory(&config.state_dir)?;
+    cooldown::Cooldown::new(&config.state_dir, config.account_dir.as_deref()).refresh()?;
     let engine = build_engine()?;
     let pre = load_pre(&engine, &config.component_path).await?;
     let guest_env = GuestEnv::capture();
@@ -1439,6 +1471,8 @@ mod tests {
 
     #[derive(Default, Debug)]
     struct MockGraphState {
+        requests: usize,
+        throttle: Option<(u16, String)>,
         sessions: usize,
         cancellations: usize,
         deltas: usize,
@@ -1491,6 +1525,16 @@ mod tests {
                     let is_upload = is_session && parts.method == http::Method::PUT;
                     let offset = {
                         let mut state = state.lock().unwrap();
+                        state.requests += 1;
+                        if let Some((status, retry_after)) = &state.throttle {
+                            return Ok::<_, hyper::Error>(Response::builder()
+                                .status(*status)
+                                .header("retry-after", retry_after)
+                                .body(Full::new(Bytes::from_static(
+                                    br#"{"error":{"code":"throttledRequest"}}"#,
+                                )))
+                                .unwrap());
+                        }
                         if is_session {
                             if !matches!(parts.method, http::Method::PUT | http::Method::DELETE)
                                 || parts.headers.contains_key("authorization")
@@ -1690,6 +1734,78 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires ONEDRIVE_TEST_COMPONENT pointing to a freshly built WASIp2 guest"]
+    async fn real_component_cooldown_defers_without_sleep_replay_or_restart_bypass() {
+        let component = PathBuf::from(
+            std::env::var_os("ONEDRIVE_TEST_COMPONENT")
+                .expect("select a freshly built guest using ONEDRIVE_TEST_COMPONENT"),
+        );
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut fixture = ComponentFixture::new(component, 1024, None).await;
+        let (status, _, body) = fixture.request("POST", "/_sync", Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let snapshot = std::fs::read(fixture.root.join("index.bin")).unwrap();
+        let before = {
+            let mut observed = fixture.observed.lock().unwrap();
+            observed.throttle = Some((429, "3600".into()));
+            observed.requests
+        };
+        let (status, _, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture.request("POST", "/_sync", Bytes::new()),
+        )
+        .await
+        .expect("initial throttle must not sleep under the writer lease");
+        assert!(!status.is_success(), "{}", String::from_utf8_lossy(&body));
+        assert_eq!(fixture.observed.lock().unwrap().requests, before + 1);
+        let state: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.root.join("graph_cooldown.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            state["until"].as_u64().unwrap()
+                >= std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3598
+        );
+        assert_eq!(state["consecutive_failures"], 1);
+        assert_eq!(state["status"], 429);
+        for _ in 0..3 {
+            let (status, _, body) = fixture.request("POST", "/_sync", Bytes::new()).await;
+            assert!(!status.is_success(), "{}", String::from_utf8_lossy(&body));
+        }
+        let server = &fixture.server;
+        let mut restarted = HostServer::new(
+            server.pre.clone(),
+            server.engine.clone(),
+            server.config.clone(),
+            server.guest_env.clone(),
+        );
+        restarted.mock_peer = Some(fixture._graph.peer);
+        fixture.server = restarted;
+        let (status, _, body) = fixture.request("POST", "/_sync", Bytes::new()).await;
+        assert!(!status.is_success(), "{}", String::from_utf8_lossy(&body));
+        let (status, _, _) = fixture
+            .request("PUT", "/not-replayed.bin", Bytes::from_static(b"content"))
+            .await;
+        assert!(!status.is_success());
+        assert_eq!(fixture.observed.lock().unwrap().requests, before + 1);
+        assert_eq!(
+            std::fs::read(fixture.root.join("index.bin")).unwrap(),
+            snapshot
+        );
+        let (status, _, body) = fixture.request("GET", "/_status", Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["capabilities"]["persistedGraphCooldown"], true);
+        assert_eq!(report["cooldown"]["active"], true);
+        assert_eq!(report["cooldown"]["status"], 429);
+        assert_eq!(fixture.observed.lock().unwrap().requests, before + 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ONEDRIVE_TEST_COMPONENT pointing to a freshly built WASIp2 guest"]
     async fn real_component_upload_and_unchanged_sync_body_progress() {
         const TOTAL: usize = 65 * 1024 * 1024 + 17;
         let component = PathBuf::from(
@@ -1700,6 +1816,13 @@ mod tests {
         let fixture = ComponentFixture::new(component, TOTAL, None).await;
         let (status, _, body) = fixture.request("POST", "/_sync", Bytes::new()).await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (_, _, body) = fixture.request("GET", "/_status", Bytes::new()).await;
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let original_revision = status["namespaceRevision"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
         let payload = Bytes::from(
             (0..TOTAL)
                 .map(|offset| (offset % 251) as u8)
@@ -1725,6 +1848,14 @@ mod tests {
             assert_eq!(state.chunks.last().unwrap().1, 5 * 1024 * 1024 + 17);
         }
         fixture.assert_no_spool();
+        let (_, _, body) = fixture.request("GET", "/_status", Bytes::new()).await;
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let uploaded_revision = status["namespaceRevision"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(uploaded_revision > original_revision);
         let (status, _, body) = fixture
             .request("GET", "/_tree?path=/large.bin", Bytes::new())
             .await;
@@ -1767,6 +1898,8 @@ mod tests {
         let (status, _, body) = fixture.request("GET", "/_status", Bytes::new()).await;
         let report = String::from_utf8(body.to_vec()).unwrap();
         assert_eq!(status, StatusCode::OK, "{report}");
+        let status: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(status["namespaceRevision"], uploaded_revision.to_string());
         assert!(
             report.contains("\"snapshot_load_skipped\":true"),
             "{report}"
