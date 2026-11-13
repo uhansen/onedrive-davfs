@@ -5,8 +5,7 @@ component (`wasm32-wasip2`) and served by a dedicated native Rust host built
 on Wasmtime. It exists as a capability-sandboxed alternative to `rclone mount`
 for syncing OneDrive on Linux, and is the intended eventual backend for the
 [`onedrive-sync`](https://github.com/uhansen/onedrive-sync) Omarchy plugin
-(that integration is a separate, later piece of work -- see "Non-goals"
-below).
+(the plugin also supports the existing single-library configuration).
 
 In normal use the host runs as a `systemd --user` daemon and is enabled for
 startup/login with `systemctl --user enable onedrive-davfs.service`.
@@ -40,13 +39,14 @@ No OAuth tokens or raw network I/O ever cross a trust boundary that isn't
 `wasi:http` itself; there is no ambient filesystem or socket access beyond
 what's explicitly granted by the native host.
 
-## Scope of this first pass
+## Backend capabilities
 
 Implemented, against the real Microsoft Graph API:
 
 - `PROPFIND` (Depth 0/1; `Depth: infinity` is refused with `403` +
   `propfind-finite-depth` per RFC 4918)
-- `GET`, `PUT` (direct/simple upload only, up to Graph's ~4 MiB ceiling)
+- `GET` (buffered), `PUT` (disk-spooled, 64 MiB default limit;
+  configurable with `ONEDRIVE_MAX_UPLOAD_BYTES`; uploads above 4 MiB use sessions)
 - `MKCOL`, `DELETE`, `MOVE`
 - `LOCK`/`UNLOCK` (fixed no-op success responses -- enough to satisfy
   davfs2's locking requirement for a single-writer mount; Graph has no
@@ -63,11 +63,12 @@ Implemented, against the real Microsoft Graph API:
   `onedrive-davfs-sync.timer` every 30s. Local `PUT`/`MKCOL`/`DELETE`/`MOVE`
   patch the snapshot immediately. `ONEDRIVE_INDEX_ENABLED=0` restores
   live Graph listings. A miss or corrupt snapshot always falls back to
-  Graph, so a bad index cannot break the mount.
+  Graph, unless the optional cache-only WebDAV lane below is enabled.
 - Plugin JSON endpoints, gated on `GET` + `X-OneDrive-Plugin: 1` (davfs2
   never sends this header, so OneDrive folders named `_status`/`_tree`/`_search`
   stay reachable as WebDAV):
   - `GET /_status` -- index crawl progress, item counts, last `/_sync` tick
+    and the current bound drive identity (tenant, selector, drive id/name/type)
   - `GET /_tree?path=/…` -- one directory of the index (Graph fallback on miss)
   - `GET /_search?q=<term>` -- case-insensitive substring search over the
     index by name, files **and** folders (unlike `/_tree`, which is
@@ -76,15 +77,22 @@ Implemented, against the real Microsoft Graph API:
     enabled or hasn't crawled yet; `q` shorter than 2 characters returns an
     empty result set; results are capped (100) with `"truncated":true` if
     the cap was hit, directories sorted first, then by path.
+  - `GET /_libraries` -- scoped library discovery for the signed-in account.
+    With no query it lists the user's accessible drives (`/me/drives`);
+    `groupId=<id>` scopes to one Microsoft 365 group; `siteId=<id>` scopes to
+    one SharePoint site; `siteUrl=<https://tenant.sharepoint.com/sites/...>`
+    resolves that site first, then lists its libraries.
+  - `GET /_resolve?selector=...` -- verifies a proposed selector and returns
+    canonical account/drive metadata for native profile setup. It does not
+    change the running library or its index.
 
 These report **metadata-index** progress (items applied per tick), not
 file-transfer bandwidth: each `GET`/`PUT` is still a direct Graph call.
 
-Explicitly **not** implemented yet:
+Intentionally **outside the WebAssembly component**:
 
-- The interactive/first-consent OAuth flow (see below -- this is
-  intentionally a separate native script, not part of the sandboxed
-  component)
+- Interactive/first-consent OAuth runs in the native browser/PKCE or
+  device-code helper (see below), not inside the sandboxed component.
 
 ## OAuth setup
 
@@ -99,26 +107,37 @@ Explicitly **not** implemented yet:
    `https://login.microsoftonline.com/common/oauth2/nativeclient`, and
    enable "Allow public client flows" (required for the device code
    flow used below).
+   For browser/PKCE sign-in, also register `http://localhost/callback`.
+   The helper chooses an ephemeral port; Entra ignores the port for registered
+   localhost native-client redirects but still matches the callback path.
 4. Under API permissions, add delegated Microsoft Graph scopes:
    `Files.ReadWrite.All`, `offline_access`, `User.Read`.
+   Add `Sites.Read.All` only if you want scoped SharePoint site discovery.
 5. Copy the **Application (client) ID** from the Overview page --
    that's `ONEDRIVE_CLIENT_ID` below. No client secret is needed (this is
-   a public client using the device code flow).
+   a public client using the device code or browser/PKCE flow).
 
 ### 2. First-time sign-in (device code flow, run once)
 
-Interactive browser sign-in can't happen inside the wasm sandbox, so it's
-a plain native script:
+Interactive browser sign-in can't happen inside the wasm sandbox, so it stays
+in native helpers. You can use either:
 
 ```sh
 ONEDRIVE_CLIENT_ID=<your-app-id> ./tools/device-code-login.sh
 ```
 
-This prints a URL and a short code, waits for you to complete sign-in in
-a browser, and writes `~/.local/state/onedrive-davfs/token.json`
-containing a refresh token. Re-run this script only if that refresh token
-is ever revoked; the daemon itself keeps it alive by refreshing it before
-each expiry.
+or:
+
+```sh
+ONEDRIVE_CLIENT_ID=<your-app-id> python3 ./tools/browser-login.py
+```
+
+The device-code helper prints a URL and short code; the browser helper opens
+the authorization page directly, listens on a loopback callback, and completes
+an authorization-code + PKCE exchange. Both write
+`~/.local/state/onedrive-davfs/token.json` containing a refresh token.
+Re-run a helper only if that refresh token is revoked; the daemon itself keeps
+it alive by refreshing it before each expiry.
 
 ### 3. Configure and run the daemon
 
@@ -148,9 +167,66 @@ directly. `ONEDRIVE_CLIENT_ID` becomes mandatory only when the daemon needs
 to refresh an expired token.
 
 `ONEDRIVE_DRIVE_BASE` defaults to `me/drive`, which targets the signed-in
-account's primary drive. You can also set it to a plain drive ID
-(`B087983F641B9ED3`) or another Graph drive selector such as
-`users/<user-id>/drive`.
+account's primary drive. You can also set it to:
+
+- a plain drive ID (`B087983F641B9ED3`)
+- `drives/<drive-id>`
+- `users/<user-id>/drive`
+- `groups/<group-id>/drive`
+- `sites/<site-id>/drive`
+
+The daemon binds its index to verified account ID, login-session ID, client,
+tenant, selector, and resolved drive ID. Changing account/login or configuration
+immediately gates cached reads until successful verification and a new crawl;
+failed verification preserves the old snapshot without exposing it under the
+new binding. Display-name changes do not force a recrawl. `accessVerified`
+means the current binding was verified when its snapshot was published, not
+that a token file guarantees continuing tenant access. Polling does not call
+Graph to reconfirm permissions.
+
+## Multiple accounts and Microsoft 365 libraries
+
+Commercial personal/work accounts, multiple tenants, explicit SharePoint
+libraries, and accessible Teams/channel backing sites use the same drive APIs.
+Government/China authorities are not supported. This implementation is
+**fixture-tested, not organizational-account certified**.
+
+Native `tools/profiles.py` maintains a version-1 account/library registry.
+Each account owns a private credential directory; each library owns a separate
+state directory, loopback endpoint, mountpoint, daemon, mount unit, and timer.
+Pass the account directory to the native host using `--account-dir`: a shared
+cross-process lock and atomic credential handoff prevent refresh-token races.
+Interrupted handoffs are recovered before another request or login. Requests
+sharing an account serialize while holding this lease; slow requests can delay
+other libraries' Graph operations. While that work is running, authenticated
+status, search and indexed-tree requests use two separate bounded read slots:
+their guest state is read-only, outbound HTTP is denied, and no credential
+lease is acquired. If the shared login and library credential copy differ,
+these reads return an explicit retry error rather than exposing stale state.
+Unindexed folders return an indexing/retry message while a sync is busy;
+normal idle browsing retains its Graph fallback. Bare reachability probes
+also bypass the busy writer, but authentication is still checked by the guest.
+The guest sees only `/state`, never the shared account store.
+The original single-library units and token location remain supported.
+
+See [the multi-profile walkthrough](INSTALL.md#multiple-accountslibraries)
+for bootstrap, generated units, startup and migration. Profile setup only
+publishes configuration; it never installs units, edits fstab, or starts mounts.
+An existing registry/library is not switched in place when verification fails.
+The frontend can use this registry for unified browsing/search and scoped
+discovery. Blank scope lists `/me/drives`; `group:<id>`, `site:<id>`, and
+`siteUrl:https://tenant.sharepoint.com/sites/...` discover only the supplied
+scope. Private/shared Teams channels may need their own explicit site.
+Discovery is bounded to 10 pages/1,000 libraries; there is no tenant-wide scan.
+
+Keep login and refresh scopes identical. `Sites.Read.All` is optional and only
+needed for endpoints requiring site lookup/consent; changing scopes requires
+interactive consent again. Admin consent, user permissions, conditional access,
+and compliant-device/broker requirements can still prevent access. The helpers
+do not bypass these policies. Diagnostics classify Graph 401/403/404 and claims
+challenges without printing token payloads or upstream error descriptions.
+Safe Graph reads retry 429/503 twice, respecting numeric or IMF-fixdate
+`Retry-After`; delays over 10 seconds are deferred explicitly, not shortened.
 
 ### 4. Mount with davfs2
 
@@ -191,7 +267,90 @@ wasm-tools validate target/wasm32-wasip2/release/onedrive_davfs.wasm
 ```sh
 cargo test --lib     # unit tests: date formatting, XML escaping, multistatus shape
 cargo test --manifest-path host/Cargo.toml
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools -p 'test_*.py'
 ```
+
+After building both release artifacts, run the entirely offline multi-host
+integration fixture (no Microsoft credentials or network requests):
+
+```sh
+ONEDRIVE_TEST_HOST="$PWD/host/target/release/onedrive-davfs-host" \
+ONEDRIVE_TEST_COMPONENT="$PWD/target/wasm32-wasip2/release/onedrive_davfs.wasm" \
+python3 -m unittest discover -s tools -p 'test_host_component.py'
+```
+
+For upload limits, disconnect cleanup and opt-in metadata concurrency, use
+the same artifact environment with `-p 'test_performance.py'`. All credentials,
+state and host processes are disposable; these tests do not contact Microsoft.
+Host tests selected with `ONEDRIVE_TEST_COMPONENT` also exercise the real guest
+against a test-only mock Graph transport; production outbound policy is unchanged.
+
+Isolated performance measurements (not cloud throughput):
+
+```sh
+python3 tools/benchmark_backend.py \
+  --host "$PWD/host/target/release/onedrive-davfs-host" \
+  --component "$PWD/target/wasm32-wasip2/release/onedrive_davfs.wasm" \
+  --cached-dav-reads --large-upload
+cargo test --locked --release benchmark_representative_snapshot -- --ignored --nocapture
+```
+
+The HTTP fixture measures credential-lock queueing and upload intake only:
+it deliberately lacks a usable Microsoft client ID. The representative
+snapshot fixture contains 32,278 files and 2,138 directories.
+
+## Optional performance settings
+
+Defaults retain serialized writes/sync and existing polling. HTTPS connections
+are reused within a bounded idle pool; request policy and DNS checks still
+apply and failed mutations are never blindly replayed. Outgoing request bodies
+respect WASI write permits and flush once, rather than every 4 KiB.
+
+- `ONEDRIVE_PERF_LOG=1`: privacy-safe queue, credential and network timings in
+  host logs; successful sync stages in authenticated status. No paths, URLs,
+  account names or tokens in timing records. Other logs/status still require
+  review before sharing.
+- `ONEDRIVE_HTTP_POOL_IDLE_PER_HOST`: default 1, range 0-4 (0 disables reuse).
+  There are at most eight idle connections globally; idle expiry is 15 seconds
+  and absolute connection lifetime is 60 seconds, checked lazily on reuse.
+- `ONEDRIVE_MAX_UPLOAD_BYTES`: explicit per-upload disk limit, default
+  67,108,864 (64 MiB), accepted range 1 byte to 250 GiB. Upload intake uses
+  private unlinked files under `/state/.uploads` (0700), then sequential
+  10 MiB Graph chunks. Unknown-length bodies are bounded, incomplete input
+  fails before creating a cloud session, and normal chunk failures cancel
+  sessions. A host crash/trap closes the local spool; uncancelled remote
+  sessions expire at Microsoft. No restart-resume or automatic mutation retry.
+  Disk availability, quota, network speed and the existing approximately
+  five-minute request budget still constrain large uploads.
+- `ONEDRIVE_CACHED_DAV_READS=1`: opt-in, network-denied HEAD/PROPFIND lane
+  while the writer is busy. Cache misses or stale credentials return 503,
+  never a network fallback. Leave disabled for applications requiring live
+  lookup of uncached names. It does not parallelize transfers or mutations.
+
+Unchanged, complete delta cursors can skip full snapshot decode; account and
+drive identity checks still run first. Changed cursors, pending rebuilds,
+legacy metadata or identity changes use the full path.
+
+Successful namespace publications also advance `namespaceRevision` in
+authenticated status. This decimal-string revision is separate from index
+generation and timestamp, so consumers can detect local changes, remote
+changes and multiple updates within one second. Cursor-only updates do not
+advance it; legacy snapshots default to revision zero.
+
+The host persists Graph cooldowns across requests/restarts, coordinating
+libraries using the same account. A throttled response defers later Graph
+requests until its `Retry-After` deadline; absent headers use bounded backoff.
+Cached status remains available and exposes a sanitized `cooldown` object.
+`capabilities.persistedGraphCooldown` lets installers verify this protection
+before enabling aggressive polling. Cooldown expiry is not a successful sync,
+and mutations are not automatically replayed.
+
+The Omarchy plugin's `SETUP.md` documents optional timer/davfs tuning with its
+render-only Bash entry point and explicit apply/restore operations. Its
+opt-in low-latency preset schedules the next tick after the previous one
+finishes, rather than overlapping requests. No installed settings change
+without explicit application. Transfers still share the serialized mutation
+lane and can delay cloud metadata refresh.
 
 Manual smoke test once a token is in place (the daemon refuses to start
 without a real shared secret, so pass one here too):
@@ -242,15 +401,18 @@ curl -u "daemon:$SECRET" -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8765/
   are treated the same way.
 - **Guest capabilities are explicit.** The host forwards only the documented
   OneDrive env vars, preopens only `/state`, keeps guest socket/name-lookup
-  APIs disabled, serializes guest invocations with a bounded queue, and
-  applies store limits and epoch interruption.
+  APIs disabled, serializes state-changing/Graph invocations with a bounded
+  queue, and applies store limits and epoch interruption. Two additional
+  read-only, network-denied stores keep cached UI requests responsive during
+  long sync ticks without allowing concurrent credential or snapshot writes.
 - **No token logging.** The component emits no log lines; Graph error
   bodies are relayed to the client as `502` text but never include the
   `Authorization` header or token endpoint payloads.
 - Request bodies are only read for `PUT` (`PROPFIND`/`LOCK` bodies are
-  ignored, so there is no XML parsing surface). `PUT` is buffered up to
-  64 MiB; files above Graph's 4 MiB simple-upload ceiling use a
-  `createUploadSession` with chunked `Content-Range` PUTs.
+  ignored, so there is no XML parsing surface). `PUT` is spooled to private,
+  unlinked disk files up to an explicit limit (64 MiB by default); files above
+  the 4 MiB simple-upload threshold use a `createUploadSession` with bounded
+  sequential `Content-Range` PUTs.
 - **Large downloads still buffer inside the guest.** The current WebDAV `GET`
   path still materializes the full Graph response body in guest memory before
   replying. The host therefore sets an explicit WebAssembly memory ceiling,
@@ -289,9 +451,9 @@ wit/
 
 ## Non-goals for this repo (currently)
 
-- No changes to the `onedrive-sync` Omarchy plugin. That plugin currently
-  talks to `rclone mount`; teaching it to talk to this daemon instead (or
-  in addition) is a deliberate follow-up, not part of this repo's scope.
+- Frontend UI code remains in the separate `onedrive-sync` repository.
+  OAuth tokens stay in native/guest code, never in the frontend.
+- This is not Office desktop coauthoring or a full offline sync client.
 
 ## License
 

@@ -139,7 +139,7 @@ pub fn propfind(config: &Config, path: &str, depth: Option<&str>) -> DavResponse
 }
 
 fn propfind_from_index(config: &Config, path: &str, depth: Option<&str>) -> Option<DavResponse> {
-    if !config.index_enabled {
+    if !config.cache_current() {
         return None;
     }
     let hit = match snapshot::lookup_file(&config.state_dir, path) {
@@ -157,6 +157,24 @@ fn propfind_from_index(config: &Config, path: &str, depth: Option<&str>) -> Opti
         Lookup::File(info) => vec![entry_from_info(path, &info, true)],
     };
     Some(DavResponse::xml(207, xml::multistatus(&entries)))
+}
+
+pub fn propfind_cached(config: &Config, path: &str, depth: Option<&str>) -> DavResponse {
+    if depth == Some("infinity") {
+        return propfind(config, path, depth);
+    }
+    propfind_from_index(config, path, depth).unwrap_or_else(|| {
+        DavResponse::error(
+            503,
+            "directory index unavailable; retry after synchronization",
+        )
+    })
+}
+
+pub fn head_cached(config: &Config, path: &str) -> DavResponse {
+    head_from_index(config, path).unwrap_or_else(|| {
+        DavResponse::error(503, "item index unavailable; retry after synchronization")
+    })
 }
 
 fn entry_from_info(path: &str, info: &ChildInfo, is_self: bool) -> DavEntry {
@@ -227,7 +245,7 @@ pub fn head(config: &Config, path: &str) -> DavResponse {
 }
 
 fn head_from_index(config: &Config, path: &str) -> Option<DavResponse> {
-    if !config.index_enabled {
+    if !config.cache_current() {
         return None;
     }
     let hit = match snapshot::lookup_file(&config.state_dir, path) {
@@ -251,11 +269,35 @@ fn head_from_index(config: &Config, path: &str) -> Option<DavResponse> {
     })
 }
 
-fn write_through(config: &Config, f: impl FnOnce(&mut crate::index::Index) -> bool) {
-    if !config.index_enabled {
-        return;
+fn write_through(
+    config: &Config,
+    f: impl FnOnce(&mut crate::index::Index) -> bool,
+) -> Result<(), String> {
+    if !config.cache_current() {
+        return Ok(());
     }
-    snapshot::mutate(&config.state_dir, f);
+    snapshot::mutate(&config.state_dir, f)
+}
+
+fn mutation_response(config: &Config, update: Result<(), String>, status: u16) -> DavResponse {
+    let mut response = DavResponse::empty(status);
+    if let Err(error) = update {
+        let diagnostic =
+            format!("Cloud mutation succeeded but local metadata publication failed: {error}");
+        let persisted = crate::sync_stats::save_failure(config, &diagnostic).is_ok();
+        response.headers.push((
+            "warning",
+            format!(
+                "199 onedrive-davfs \"Cloud mutation succeeded; local metadata refresh failed{}\"",
+                if persisted {
+                    "; see sync diagnostic"
+                } else {
+                    "; diagnostic persistence also failed"
+                }
+            ),
+        ));
+    }
+    response
 }
 
 fn apply_or_upsert(
@@ -273,33 +315,32 @@ fn apply_or_upsert(
     idx.upsert_at_path(path, meta)
 }
 
-pub fn put(config: &Config, path: &str, body: &[u8]) -> DavResponse {
-    if body.len() as u64 > graph::MAX_UPLOAD_BYTES {
+pub fn put(config: &Config, path: &str, body: &crate::upload::Upload) -> DavResponse {
+    if body.size > config.max_upload_bytes {
         return DavResponse::error(
             413,
             format!(
                 "file is {} bytes; this build only supports uploads up to {} bytes",
-                body.len(),
-                graph::MAX_UPLOAD_BYTES
+                body.size, config.max_upload_bytes
             ),
         );
     }
     match graph::put_content(config, path, body) {
         Ok(item) => {
-            write_through(config, |idx| {
+            let update = write_through(config, |idx| {
                 apply_or_upsert(
                     idx,
                     item,
                     path,
                     ItemMeta {
                         is_dir: false,
-                        size: body.len() as u64,
+                        size: body.size,
                         mtime: 0,
                         etag: String::new(),
                     },
                 )
             });
-            DavResponse::empty(201)
+            mutation_response(config, update, 201)
         }
         Err(e) => DavResponse::error(502, e),
     }
@@ -314,7 +355,7 @@ pub fn mkcol(config: &Config, path: &str) -> DavResponse {
         .unwrap_or(path);
     match graph::create_folder(config, &parent, name) {
         Ok(item) => {
-            write_through(config, |idx| {
+            let update = write_through(config, |idx| {
                 apply_or_upsert(
                     idx,
                     item,
@@ -327,7 +368,7 @@ pub fn mkcol(config: &Config, path: &str) -> DavResponse {
                     },
                 )
             });
-            DavResponse::empty(201)
+            mutation_response(config, update, 201)
         }
         Err(e) => DavResponse::error(502, e),
     }
@@ -336,8 +377,8 @@ pub fn mkcol(config: &Config, path: &str) -> DavResponse {
 pub fn delete(config: &Config, path: &str) -> DavResponse {
     match graph::delete(config, path) {
         Ok(()) => {
-            write_through(config, |idx| idx.remove_at_path(path));
-            DavResponse::empty(204)
+            let update = write_through(config, |idx| idx.remove_at_path(path));
+            mutation_response(config, update, 204)
         }
         Err(e) => DavResponse::error(502, e),
     }
@@ -348,7 +389,7 @@ pub fn delete(config: &Config, path: &str) -> DavResponse {
 pub fn r#move(config: &Config, path: &str, destination: &str) -> DavResponse {
     match graph::move_or_rename(config, path, destination) {
         Ok(item) => {
-            write_through(config, |idx| {
+            let update = write_through(config, |idx| {
                 if let Some(it) = item {
                     idx.apply(it);
                     if idx.resolve(destination).is_some() {
@@ -357,7 +398,7 @@ pub fn r#move(config: &Config, path: &str, destination: &str) -> DavResponse {
                 }
                 idx.move_at_path(path, destination)
             });
-            DavResponse::empty(201)
+            mutation_response(config, update, 201)
         }
         Err(e) => DavResponse::error(502, e),
     }

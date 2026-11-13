@@ -97,12 +97,28 @@ pub fn send(req: HttpRequest) -> Result<HttpResponse, String> {
             let stream = body
                 .write()
                 .map_err(|_| "failed to open request body stream".to_string())?;
-            // wasi:io `blocking-write-and-flush` traps if contents > 4096 bytes.
-            const WRITE_CHUNK: usize = 4096;
-            for chunk in req.body.chunks(WRITE_CHUNK) {
+            let pollable = stream.subscribe();
+            let mut offset = 0;
+            while offset < req.body.len() {
+                poll::poll(&[&pollable]);
+                let permit = stream
+                    .check_write()
+                    .map_err(|error| format!("failed checking request body stream: {error:?}"))?
+                    as usize;
+                if permit == 0 {
+                    continue;
+                }
+                let end = (offset + permit.min(64 * 1024)).min(req.body.len());
                 stream
-                    .blocking_write_and_flush(chunk)
+                    .write(&req.body[offset..end])
                     .map_err(|e| format!("failed writing request body: {e:?}"))?;
+                offset = end;
+            }
+            // Hyper can close a fully written Content-Length body before flush.
+            // The response below still determines whether the transfer succeeded.
+            match stream.blocking_flush() {
+                Ok(()) | Err(crate::bindings::wasi::io::streams::StreamError::Closed) => {}
+                Err(error) => return Err(format!("failed flushing request body: {error:?}")),
             }
         }
         OutgoingBody::finish(body, None)

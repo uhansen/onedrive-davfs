@@ -41,6 +41,9 @@ jobs:
       - name: Run host tests
         run: cargo test --manifest-path "${HOST_MANIFEST}"
 
+      - name: Test native authentication and profile setup
+        run: python3 -m unittest discover -s tools -p 'test_*.py'
+
       - name: Check formatting for handwritten Rust sources
         run: |
           git ls-files '*.rs' \
@@ -55,6 +58,12 @@ jobs:
 
       - name: Validate WebAssembly component
         run: wasm-tools validate "${COMPONENT_PATH}"
+
+      - name: Offline multi-host component isolation
+        env:
+          ONEDRIVE_TEST_HOST: ${{ github.workspace }}/host/target/release/onedrive-davfs-host
+          ONEDRIVE_TEST_COMPONENT: ${{ github.workspace }}/target/wasm32-wasip2/release/onedrive_davfs.wasm
+        run: python3 -m unittest discover -s tools -p 'test_host_component.py'
 
       - name: Upload WebAssembly artifact
         uses: actions/upload-artifact@v4

@@ -24,6 +24,8 @@ const EXPIRY_SAFETY_MARGIN_SECS: u64 = 60;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TokenFile {
+    #[serde(default)]
+    credential_id: Option<String>,
     refresh_token: String,
     #[serde(default)]
     access_token: Option<String>,
@@ -40,7 +42,15 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-fn now_secs() -> u64 {
+#[derive(Debug, Deserialize)]
+struct TokenErrorResponse {
+    #[serde(default)]
+    error: String,
+    #[serde(rename = "error_description", default)]
+    error_description: String,
+}
+
+pub(crate) fn now_secs() -> u64 {
     wall_clock::now().seconds
 }
 
@@ -48,16 +58,42 @@ fn load(config: &Config) -> Result<TokenFile, String> {
     let bytes = state_file::read_file(&config.state_dir, TOKEN_FILE)?.ok_or_else(|| {
         format!("no {TOKEN_FILE} found in state dir; run tools/device-code-login.sh first")
     })?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("failed to parse {TOKEN_FILE}: {e}"))
+    serde_json::from_slice(&bytes).map_err(|_| format!("invalid {TOKEN_FILE}; sign in again"))
 }
 
 fn save(config: &Config, token: &TokenFile) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(token)
         .map_err(|e| format!("failed to serialize {TOKEN_FILE}: {e}"))?;
-    state_file::write_file(&config.state_dir, TOKEN_FILE, &bytes)
+    state_file::write_atomic(&config.state_dir, TOKEN_FILE, &bytes)
 }
 
-fn refresh(config: &Config, refresh_token: &str) -> Result<TokenFile, String> {
+pub fn credential_id(config: &Config) -> Result<Option<String>, String> {
+    Ok(load(config)?.credential_id)
+}
+
+pub fn credential_status(config: &Config) -> Result<(bool, u64), String> {
+    if state_file::read_file(&config.state_dir, TOKEN_FILE)?.is_none() {
+        return Ok((false, 0));
+    }
+    let token = load(config)?;
+    Ok((
+        !token.refresh_token.is_empty(),
+        token.expires_at.saturating_sub(now_secs()),
+    ))
+}
+
+pub fn bind_legacy_credential(config: &Config, account_id: &str) -> Result<String, String> {
+    let mut token = load(config)?;
+    if let Some(id) = token.credential_id {
+        return Ok(id);
+    }
+    let id = format!("legacy:{account_id}");
+    token.credential_id = Some(id.clone());
+    save(config, &token)?;
+    Ok(id)
+}
+
+fn refresh(config: &Config, token: &TokenFile) -> Result<TokenFile, String> {
     let client_id = config
         .client_id
         .as_deref()
@@ -69,8 +105,8 @@ fn refresh(config: &Config, refresh_token: &str) -> Result<TokenFile, String> {
     let form = format!(
         "client_id={}&grant_type=refresh_token&refresh_token={}&scope={}",
         urlencode(client_id),
-        urlencode(refresh_token),
-        urlencode("offline_access Files.ReadWrite.All User.Read"),
+        urlencode(&token.refresh_token),
+        urlencode(&config.auth_scopes),
     );
 
     let response = http_client::send(HttpRequest {
@@ -81,26 +117,50 @@ fn refresh(config: &Config, refresh_token: &str) -> Result<TokenFile, String> {
     })?;
 
     if response.status != 200 {
-        return Err(format!(
-            "token refresh failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(format_token_error(response.status, &response.body));
     }
 
     let parsed: TokenResponse = serde_json::from_slice(&response.body)
-        .map_err(|e| format!("failed to parse token response: {e}"))?;
+        .map_err(|_| "authentication server returned an invalid token response".to_string())?;
 
     Ok(TokenFile {
+        credential_id: token.credential_id.clone(),
         // Graph AD rotates refresh tokens fairly often; persist whichever
         // one we were just handed, falling back to the one we sent if the
         // response omitted it.
         refresh_token: parsed
             .refresh_token
-            .unwrap_or_else(|| refresh_token.to_string()),
+            .unwrap_or_else(|| token.refresh_token.clone()),
         access_token: Some(parsed.access_token),
         expires_at: now_secs() + parsed.expires_in.saturating_sub(EXPIRY_SAFETY_MARGIN_SECS),
     })
+}
+
+fn format_token_error(status: u16, body: &[u8]) -> String {
+    if let Ok(parsed) = serde_json::from_slice::<TokenErrorResponse>(body) {
+        let code = match parsed.error.as_str() {
+            code @ ("invalid_grant"
+            | "consent_required"
+            | "interaction_required"
+            | "access_denied"
+            | "invalid_client") => code,
+            _ => "unknown_error",
+        };
+        let advice = if parsed.error_description.contains("AADSTS530") {
+            "conditional-access or device-compliance policy requires interactive sign-in or administrator action"
+        } else {
+            match code {
+                "invalid_grant" => "sign in again; the credential may be expired or revoked",
+                "consent_required" | "interaction_required" => {
+                    "browser sign-in or administrator consent is required"
+                }
+                "access_denied" => "tenant policy denied access; contact your administrator",
+                _ => "check app registration, tenant authority, and configured scopes",
+            }
+        };
+        return format!("token refresh failed with status {status}: {code}; {advice}");
+    }
+    format!("token refresh failed with status {status}; sign in again or check tenant policy")
 }
 
 /// Returns a valid `Authorization: Bearer ...` value, refreshing the
@@ -114,7 +174,7 @@ pub fn bearer_token(config: &Config) -> Result<String, String> {
         }
     }
 
-    token = refresh(config, &token.refresh_token)?;
+    token = refresh(config, &token)?;
     save(config, &token)?;
 
     Ok(format!(
@@ -141,4 +201,33 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_error_prefers_oauth_shape() {
+        let body =
+            br#"{"error":"invalid_grant","error_description":"AADSTS700082: The refresh token has expired."}"#;
+        let out = format_token_error(400, body);
+        assert!(out.contains("invalid_grant"));
+        assert!(out.contains("sign in again"));
+        assert!(!out.contains("AADSTS700082"));
+        assert!(
+            !format_token_error(
+                400,
+                br#"{"error":"private-data","error_description":"private-token"}"#
+            )
+            .contains("private")
+        );
+        assert!(
+            format_token_error(
+                400,
+                br#"{"error":"invalid_grant","error_description":"AADSTS53003 private-token"}"#
+            )
+            .contains("conditional-access")
+        );
+    }
 }

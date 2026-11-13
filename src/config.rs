@@ -14,16 +14,21 @@ pub struct Config {
     pub client_id: Option<String>,
     pub tenant_id: String,
     pub drive_base: String,
+    pub auth_scopes: String,
     pub basic_auth_secret: Option<String>,
     /// Preopened directory used to persist `token.json`. Must be granted to
-    /// the component via `wasmtime serve --dir <path>::/state`.
+    /// the component by the native Wasmtime host.
     pub state_dir: Descriptor,
     /// Serve PROPFIND/HEAD from the local snapshot. `ONEDRIVE_INDEX_ENABLED=0`
     /// restores live Graph listings.
     pub index_enabled: bool,
     pub sync_max_pages: usize,
     pub sync_budget_ms: u64,
+    pub max_upload_bytes: u64,
+    pub perf_log: bool,
 }
+
+pub const DEFAULT_AUTH_SCOPES: &str = "offline_access Files.ReadWrite.All User.Read";
 
 fn env(name: &str) -> Option<String> {
     environment::get_environment()
@@ -33,13 +38,41 @@ fn env(name: &str) -> Option<String> {
 }
 
 impl Config {
+    pub fn cache_current(&self) -> bool {
+        if !self.index_enabled {
+            return false;
+        }
+        let Ok(Some(meta)) = crate::snapshot::read_meta(&self.state_dir) else {
+            return false;
+        };
+        let Ok(credential_id) = crate::auth::credential_id(self) else {
+            return false;
+        };
+        meta.binding.is_some_and(|binding| {
+            binding.matches_configuration(
+                &self.tenant_id,
+                self.client_id.as_deref(),
+                &self.drive_base,
+                credential_id.as_deref(),
+            )
+        })
+    }
+
     /// Loads configuration from the environment and preopens. A client id
     /// is optional at startup so a pre-seeded, still-valid access token can
     /// be used immediately; only token refresh requires `ONEDRIVE_CLIENT_ID`.
     pub fn load() -> Result<Self, String> {
         let client_id = env("ONEDRIVE_CLIENT_ID");
         let tenant_id = env("ONEDRIVE_TENANT_ID").unwrap_or_else(|| "common".to_string());
-        let drive_base = env("ONEDRIVE_DRIVE_BASE").unwrap_or_else(|| "me/drive".to_string());
+        validate_authority(&tenant_id)?;
+        let drive_base = normalize_drive_base(
+            &env("ONEDRIVE_DRIVE_BASE").unwrap_or_else(|| "me/drive".to_string()),
+        )?;
+        let auth_scopes = normalize_auth_scopes(
+            env("ONEDRIVE_SCOPES")
+                .as_deref()
+                .unwrap_or(DEFAULT_AUTH_SCOPES),
+        )?;
         let basic_auth_secret = validate_basic_auth_secret(
             env("ONEDRIVE_BASIC_AUTH_SECRET"),
             env("ONEDRIVE_ALLOW_UNAUTHENTICATED").as_deref() == Some("1"),
@@ -56,6 +89,7 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(20_000)
             .max(1);
+        let max_upload_bytes = upload_limit(env("ONEDRIVE_MAX_UPLOAD_BYTES").as_deref())?;
 
         let mut state_dir = None;
         for (descriptor, path) in preopens::get_directories() {
@@ -71,13 +105,124 @@ impl Config {
             client_id,
             tenant_id,
             drive_base,
+            auth_scopes,
             basic_auth_secret,
             state_dir,
             index_enabled,
             sync_max_pages,
             sync_budget_ms,
+            max_upload_bytes,
+            perf_log: env("ONEDRIVE_PERF_LOG").as_deref() == Some("1"),
         })
     }
+}
+
+fn upload_limit(raw: Option<&str>) -> Result<u64, String> {
+    let value = match raw {
+        None => 64 * 1024 * 1024,
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| "ONEDRIVE_MAX_UPLOAD_BYTES must be an integer".to_string())?,
+    };
+    if value == 0 || value > 250 * 1024 * 1024 * 1024 {
+        return Err("ONEDRIVE_MAX_UPLOAD_BYTES must be between 1 and 250 GiB".into());
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod upload_limit_tests {
+    use super::*;
+
+    #[test]
+    fn conservative_upload_default_and_explicit_large_uploads() {
+        assert_eq!(upload_limit(None).unwrap(), 64 * 1024 * 1024);
+        assert_eq!(
+            upload_limit(Some("1073741824")).unwrap(),
+            1024 * 1024 * 1024
+        );
+        for raw in ["0", "-1", "invalid", "268435456001"] {
+            assert!(upload_limit(Some(raw)).is_err());
+        }
+    }
+}
+
+fn normalize_auth_scopes(raw: &str) -> Result<String, String> {
+    let scopes = raw
+        .split_whitespace()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    if scopes.is_empty() {
+        return Err("ONEDRIVE_SCOPES must contain at least one OAuth scope".to_string());
+    }
+    if !scopes.contains(&"offline_access")
+        || scopes.iter().any(|scope| {
+            !matches!(
+                *scope,
+                "offline_access" | "Files.ReadWrite.All" | "User.Read" | "Sites.Read.All"
+            )
+        })
+    {
+        return Err(
+            "ONEDRIVE_SCOPES must include offline_access and only supported delegated Graph scopes"
+                .into(),
+        );
+    }
+    Ok(scopes.join(" "))
+}
+
+pub fn normalize_drive_base(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.eq_ignore_ascii_case("me/drive") {
+        return Ok("me/drive".to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("drives/") {
+        validate_selector_id(rest, "drive id")?;
+        return Ok(format!("drives/{rest}"));
+    }
+    for prefix in ["users", "groups", "sites"] {
+        let head = format!("{prefix}/");
+        if let Some(rest) = trimmed.strip_prefix(&head) {
+            let Some(id) = rest.strip_suffix("/drive") else {
+                return Err(format!(
+                    "unsupported ONEDRIVE_DRIVE_BASE selector {trimmed:?}; expected {prefix}/<id>/drive"
+                ));
+            };
+            validate_selector_id(id, &format!("{prefix} selector id"))?;
+            return Ok(format!("{prefix}/{id}/drive"));
+        }
+    }
+    validate_selector_id(trimmed, "drive id")?;
+    Ok(format!("drives/{trimmed}"))
+}
+
+pub(crate) fn validate_selector_id(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || matches!(value, "." | "..") {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(format!("{label} must not contain path separators"));
+    }
+    if value
+        .chars()
+        .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '!' | '-' | '_' | '.' | '@' | ','))
+    {
+        return Err(format!("{label} contains unsupported characters"));
+    }
+    Ok(())
+}
+
+fn validate_authority(tenant: &str) -> Result<(), String> {
+    if tenant.is_empty()
+        || !tenant
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+    {
+        return Err(
+            "ONEDRIVE_TENANT_ID must be a tenant id/domain or a supported authority name".into(),
+        );
+    }
+    Ok(())
 }
 
 /// Minimum accepted length for the shared Basic-auth secret.
@@ -143,5 +288,36 @@ mod tests {
             validate_basic_auth_secret(Some(s.into()), false).unwrap(),
             Some(s.to_string())
         );
+    }
+
+    #[test]
+    fn drive_base_is_normalized_and_validated() {
+        assert_eq!(normalize_drive_base("me/drive").unwrap(), "me/drive");
+        assert_eq!(
+            normalize_drive_base("/drives/B087983F641B9ED3/").unwrap(),
+            "drives/B087983F641B9ED3"
+        );
+        assert_eq!(
+            normalize_drive_base("users/alice@example.com/drive").unwrap(),
+            "users/alice@example.com/drive"
+        );
+        assert_eq!(
+            normalize_drive_base("sites/tenant.sharepoint.com,abc,def/drive").unwrap(),
+            "sites/tenant.sharepoint.com,abc,def/drive"
+        );
+        assert!(normalize_drive_base("users/alice/drive/root").is_err());
+        assert!(normalize_drive_base("../bad").is_err());
+        assert!(normalize_drive_base("").is_err());
+        assert!(normalize_drive_base("drives/..").is_err());
+        assert!(normalize_drive_base("b!abc%2fother").is_err());
+    }
+
+    #[test]
+    fn auth_scopes_are_normalized() {
+        assert_eq!(
+            normalize_auth_scopes(" offline_access   Files.ReadWrite.All  User.Read ").unwrap(),
+            "offline_access Files.ReadWrite.All User.Read"
+        );
+        assert!(normalize_auth_scopes("   ").is_err());
     }
 }

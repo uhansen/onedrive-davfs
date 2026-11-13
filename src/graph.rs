@@ -12,14 +12,11 @@ use serde::Deserialize;
 use crate::bindings::wasi::http::types::Method;
 use crate::config::Config;
 use crate::http_client::{self, HttpRequest};
-use crate::index::{DeltaItem, ItemMeta};
+use crate::index::{DeltaItem, DriveBinding, ItemMeta};
 
-/// Graph's simple (non-chunked) upload only supports files up to ~4 MiB.
-/// Larger files go through `createUploadSession` + chunked `Content-Range`.
+/// This implementation uses simple uploads up to 4 MiB; larger files use
+/// `createUploadSession` with chunked `Content-Range`.
 pub const MAX_SIMPLE_UPLOAD_BYTES: u64 = 4 * 1024 * 1024;
-
-/// Hard ceiling on a single `PUT`: the whole body is buffered in the guest.
-pub const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Graph upload-session chunks must be a multiple of 320 KiB except the last.
 const UPLOAD_CHUNK_BYTES: usize = 10 * 1024 * 1024;
@@ -68,6 +65,22 @@ struct ParentRef {
 }
 
 #[derive(Deserialize)]
+struct IdentitySet {
+    #[serde(default)]
+    user: Option<Identity>,
+    #[serde(default)]
+    application: Option<Identity>,
+}
+
+#[derive(Deserialize)]
+struct Identity {
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+    #[serde(rename = "userPrincipalName", default)]
+    user_principal_name: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct FileFacet {
     #[serde(rename = "mimeType", default)]
     mime_type: Option<String>,
@@ -78,6 +91,64 @@ struct DriveItemPage {
     value: Vec<DriveItem>,
     #[serde(rename = "@odata.nextLink", default)]
     next_link: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryInfo {
+    pub selector: String,
+    pub drive_id: String,
+    pub drive_name: String,
+    pub drive_type: String,
+    pub web_url: String,
+    pub owner_label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedSite {
+    pub id: String,
+    pub display_name: String,
+    pub web_url: String,
+    pub hostname: String,
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+struct DriveResource {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "driveType", default)]
+    drive_type: String,
+    #[serde(rename = "webUrl", default)]
+    web_url: String,
+    #[serde(default)]
+    owner: Option<IdentitySet>,
+    #[serde(rename = "createdBy", default)]
+    created_by: Option<IdentitySet>,
+}
+
+#[derive(Deserialize)]
+struct DriveResourcePage {
+    value: Vec<DriveResource>,
+    #[serde(rename = "@odata.nextLink", default)]
+    next_link: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SiteResource {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "displayName", default)]
+    display_name: String,
+    #[serde(rename = "webUrl", default)]
+    web_url: String,
+}
+
+pub enum LibraryScope<'a> {
+    Me,
+    Group(&'a str),
+    Site(&'a str),
 }
 
 /// Converts an ISO-8601 Graph timestamp (`"2026-01-12T08:30:00Z"`) to Unix
@@ -108,12 +179,15 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 fn drive_root_segment(drive_base: &str) -> String {
-    let trimmed = drive_base.trim_matches('/');
-    if trimmed.contains('/') {
-        format!("/{trimmed}")
-    } else {
-        format!("/drives/{trimmed}")
-    }
+    format!(
+        "/{}",
+        drive_base
+            .trim_matches('/')
+            .split('/')
+            .map(crate::xml::pct_encode)
+            .collect::<Vec<_>>()
+            .join("/")
+    )
 }
 
 /// Graph `parentReference.path` uses `/<drive>/root:` for the drive root
@@ -165,12 +239,159 @@ fn graph_request(
     if let Some(ct) = content_type {
         headers.push(("content-type", ct));
     }
-    http_client::send(HttpRequest {
+    send_with_read_retry(HttpRequest {
         method,
         url,
         headers: &headers,
         body,
     })
+}
+
+fn send_with_read_retry(request: HttpRequest<'_>) -> Result<http_client::HttpResponse, String> {
+    for attempt in 0..=2 {
+        let response = http_client::send(HttpRequest {
+            method: request.method.clone(),
+            url: request.url,
+            headers: request.headers,
+            body: request.body,
+        })?;
+        if !matches!(request.method, Method::Get | Method::Head)
+            || !matches!(response.status, 429 | 503)
+        {
+            return Ok(response);
+        }
+        if response.header_value("x-onedrive-host-cooldown").as_deref() == Some("1") {
+            return Err(format!(
+                "Microsoft Graph is throttled/unavailable (HTTP {}); host cooldown active; retry later",
+                response.status
+            ));
+        }
+        let seconds = retry_delay(
+            response.header_value("retry-after").as_deref(),
+            crate::auth::now_secs(),
+        )?;
+        if attempt == 2 {
+            return Err(format!(
+                "Microsoft Graph is throttled/unavailable (HTTP {}); retry later",
+                response.status
+            ));
+        }
+        wait_seconds(seconds);
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+fn retry_delay(header: Option<&str>, now: u64) -> Result<u64, String> {
+    let seconds = match header {
+        None => 1,
+        Some(value) => match value.trim().parse::<u64>() {
+            Ok(seconds) => seconds,
+            Err(_) => parse_http_date(value)
+                .map(|date| date.saturating_sub(now))
+                .ok_or("Microsoft Graph returned invalid Retry-After; retry later")?,
+        },
+    };
+    if seconds > 10 {
+        return Err(format!(
+            "Microsoft Graph requested Retry-After {seconds}s; deferred to a later request"
+        ));
+    }
+    Ok(seconds)
+}
+
+fn parse_http_date(value: &str) -> Option<u64> {
+    let fields: Vec<_> = value.split_whitespace().collect();
+    let [weekday, day, month, year, time, "GMT"] = fields[..] else {
+        return None;
+    };
+    if !matches!(
+        weekday,
+        "Mon," | "Tue," | "Wed," | "Thu," | "Fri," | "Sat," | "Sun,"
+    ) {
+        return None;
+    }
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|name| *name == month)? as u32
+        + 1;
+    let year = year.parse::<i64>().ok()?;
+    let day = day.parse::<u32>().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    let parts: Vec<_> = time.split(':').collect();
+    let [hour, minute, second] = parts[..] else {
+        return None;
+    };
+    let (hour, minute, second) = (
+        hour.parse::<u32>().ok()?,
+        minute.parse::<u32>().ok()?,
+        second.parse::<u32>().ok()?,
+    );
+    if !(1601..=9999).contains(&year)
+        || day == 0
+        || day > month_days
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(
+        (days_from_civil(year, month, day) * 86400 + i64::from(hour * 3600 + minute * 60 + second))
+            .max(0) as u64,
+    )
+}
+
+fn graph_failure(operation: &str, response: &http_client::HttpResponse) -> String {
+    let payload = serde_json::from_slice::<serde_json::Value>(&response.body).ok();
+    let code = payload
+        .as_ref()
+        .and_then(|value| value.pointer("/error/code"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let challenge = response
+        .header_value("www-authenticate")
+        .unwrap_or_default();
+    let advice = if code.eq_ignore_ascii_case("insufficient_claims")
+        || challenge.contains("insufficient_claims")
+    {
+        "Conditional access requires interactive sign-in or a compliant device; tenant policies cannot be bypassed"
+    } else {
+        match response.status {
+            401 => {
+                "Sign in again; credentials are expired, revoked, or not accepted by this tenant"
+            }
+            403 => {
+                "Access denied; check user library permissions, delegated/admin consent, and tenant policy"
+            }
+            404 => {
+                "Library or item not found or inaccessible; verify the explicit drive/site/group target"
+            }
+            429 | 503 => "Microsoft Graph is throttled/unavailable; retry later",
+            _ => "Microsoft Graph request failed; check library policy and operation support",
+        }
+    };
+    format!("{operation} failed (HTTP {}): {advice}", response.status)
+}
+
+fn wait_seconds(seconds: u64) {
+    #[cfg(target_arch = "wasm32")]
+    crate::bindings::wasi::clocks::monotonic_clock::subscribe_duration(seconds * 1_000_000_000)
+        .block();
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
 }
 
 fn to_item(item: &DriveItem) -> GraphItem {
@@ -217,6 +438,211 @@ fn to_delta_item(item: &DriveItem) -> Option<DeltaItem> {
             etag: item.etag.clone().unwrap_or_default(),
         },
     })
+}
+
+fn owner_label(sets: &[Option<IdentitySet>]) -> String {
+    for set in sets.iter().flatten() {
+        for identity in [set.user.as_ref(), set.application.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = identity.display_name.as_deref().filter(|s| !s.is_empty()) {
+                return name.to_string();
+            }
+            if let Some(upn) = identity
+                .user_principal_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+            {
+                return upn.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn library_info(drive: DriveResource) -> Option<LibraryInfo> {
+    if drive.id.is_empty() {
+        return None;
+    }
+    Some(LibraryInfo {
+        selector: format!("drives/{}", drive.id),
+        drive_id: drive.id,
+        drive_name: drive.name,
+        drive_type: drive.drive_type,
+        web_url: drive.web_url,
+        owner_label: owner_label(&[drive.owner, drive.created_by]),
+    })
+}
+
+pub fn current_drive_binding(config: &Config) -> Result<DriveBinding, String> {
+    resolve_drive(config, &config.drive_base)
+}
+
+pub fn resolve_drive(config: &Config, selector: &str) -> Result<DriveBinding, String> {
+    let account_response = graph_request(
+        config,
+        Method::Get,
+        "https://graph.microsoft.com/v1.0/me?$select=id",
+        None,
+        &[],
+    )?;
+    if account_response.status != 200 {
+        return Err(graph_failure(
+            "Account identity verification",
+            &account_response,
+        ));
+    }
+    let account: serde_json::Value = serde_json::from_slice(&account_response.body)
+        .map_err(|_| "invalid account identity response".to_string())?;
+    let account_id = account["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or("account identity missing id")?
+        .to_string();
+    let url = format!(
+        "https://graph.microsoft.com/v1.0{}?$select=id,name,driveType,webUrl,owner,createdBy",
+        drive_root_segment(selector)
+    );
+    let response = graph_request(config, Method::Get, &url, None, &[])?;
+    if response.status != 200 {
+        return Err(graph_failure("Drive verification", &response));
+    }
+    let drive: DriveResource = serde_json::from_slice(&response.body)
+        .map_err(|e| format!("failed to parse drive metadata: {e}"))?;
+    let info = library_info(drive).ok_or_else(|| "drive metadata missing id".to_string())?;
+    crate::config::validate_selector_id(&info.drive_id, "resolved drive id")?;
+    let credential_id = crate::auth::bind_legacy_credential(config, &account_id)?;
+    Ok(DriveBinding {
+        account_id,
+        credential_id,
+        client_id: config.client_id.clone(),
+        tenant_id: config.tenant_id.clone(),
+        drive_base: selector.to_string(),
+        drive_id: info.drive_id,
+        drive_name: info.drive_name,
+        drive_type: info.drive_type,
+        web_url: info.web_url,
+        owner_label: info.owner_label,
+    })
+}
+
+fn encoded_segment(value: &str) -> String {
+    crate::xml::pct_encode(value)
+}
+
+fn library_list_url(scope: LibraryScope<'_>) -> String {
+    match scope {
+        LibraryScope::Me => "https://graph.microsoft.com/v1.0/me/drives?$select=id,name,driveType,webUrl,owner,createdBy&$top=100".to_string(),
+        LibraryScope::Group(group_id) => format!(
+            "https://graph.microsoft.com/v1.0/groups/{}/drives?$select=id,name,driveType,webUrl,owner,createdBy&$top=100",
+            encoded_segment(group_id)
+        ),
+        LibraryScope::Site(site_id) => format!(
+            "https://graph.microsoft.com/v1.0/sites/{}/drives?$select=id,name,driveType,webUrl,owner,createdBy&$top=100",
+            encoded_segment(site_id)
+        ),
+    }
+}
+
+pub fn list_libraries(
+    config: &Config,
+    scope: LibraryScope<'_>,
+) -> Result<Vec<LibraryInfo>, String> {
+    match &scope {
+        LibraryScope::Me => {}
+        LibraryScope::Group(id) | LibraryScope::Site(id) => {
+            crate::config::validate_selector_id(id, "discovery scope id")?;
+        }
+    }
+    let mut url = library_list_url(scope);
+    let mut libraries = Vec::new();
+    let mut pages = 0usize;
+    loop {
+        let response = graph_request(config, Method::Get, &url, None, &[])?;
+        if response.status != 200 {
+            return Err(graph_failure("Scoped library discovery", &response));
+        }
+        let page: DriveResourcePage = serde_json::from_slice(&response.body)
+            .map_err(|e| format!("failed to parse library discovery response: {e}"))?;
+        libraries.extend(page.value.into_iter().filter_map(library_info));
+        pages += 1;
+        if libraries.len() > 1000 || (pages >= 10 && page.next_link.is_some()) {
+            return Err("library discovery exceeded 10 pages/1000 libraries; choose a narrower site/group scope".into());
+        }
+        match page.next_link {
+            Some(next) => url = validate_next_link(&next, pages)?,
+            None => break,
+        }
+    }
+    libraries.sort_by(|a, b| {
+        a.drive_name
+            .cmp(&b.drive_name)
+            .then_with(|| a.drive_id.cmp(&b.drive_id))
+    });
+    Ok(libraries)
+}
+
+pub fn resolve_site_by_url(config: &Config, site_url: &str) -> Result<ResolvedSite, String> {
+    let (host, path) = parse_sharepoint_site_url(site_url)?;
+    let url = format!(
+        "https://graph.microsoft.com/v1.0/sites/{}:{}?$select=id,displayName,webUrl",
+        encoded_segment(&host),
+        path
+    );
+    let response = graph_request(config, Method::Get, &url, None, &[])?;
+    if response.status != 200 {
+        return Err(graph_failure(
+            "Site resolution (may require Sites.Read.All consent)",
+            &response,
+        ));
+    }
+    let site: SiteResource = serde_json::from_slice(&response.body)
+        .map_err(|e| format!("failed to parse site metadata: {e}"))?;
+    if site.id.is_empty() {
+        return Err("resolved site metadata missing id".to_string());
+    }
+    Ok(ResolvedSite {
+        id: site.id,
+        display_name: site.display_name,
+        web_url: site.web_url,
+        hostname: host,
+        path,
+    })
+}
+
+fn parse_sharepoint_site_url(site_url: &str) -> Result<(String, String), String> {
+    let raw = site_url.trim();
+    let without_scheme = raw
+        .strip_prefix("https://")
+        .ok_or_else(|| "siteUrl must start with https://".to_string())?;
+    let (host, path_with_rest) = without_scheme
+        .split_once('/')
+        .ok_or_else(|| "siteUrl must include a SharePoint site path".to_string())?;
+    if !(host.ends_with(".sharepoint.com") || host.ends_with(".sharepoint-df.com")) {
+        return Err("siteUrl must target a sharepoint.com or sharepoint-df.com host".to_string());
+    }
+    if host.contains('@')
+        || host.contains(':')
+        || host
+            .chars()
+            .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '.'))
+    {
+        return Err("invalid SharePoint hostname".into());
+    }
+    let path = crate::sanitize_path(&format!(
+        "/{}",
+        path_with_rest.split(['?', '#']).next().unwrap_or("")
+    ))?;
+    if path == "/" {
+        return Err("siteUrl must include a concrete site path".to_string());
+    }
+    let encoded = path
+        .split('/')
+        .map(crate::xml::pct_encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok((host.to_string(), encoded))
 }
 
 pub struct DeltaPage {
@@ -296,10 +722,9 @@ pub fn delta(config: &Config, url: &str) -> Result<DeltaPage, DeltaError> {
         return Err(DeltaError::Resync);
     }
     if response.status != 200 {
-        return Err(DeltaError::Other(format!(
-            "graph delta failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
+        return Err(DeltaError::Other(graph_failure(
+            "Index synchronization",
+            &response,
         )));
     }
     parse_delta_page(&response.body).map_err(DeltaError::Other)
@@ -332,11 +757,7 @@ pub fn stat(config: &Config, path: &str) -> Result<GraphItem, String> {
         return Err("not found".to_string());
     }
     if response.status != 200 {
-        return Err(format!(
-            "graph stat failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Item metadata", &response));
     }
     let item: DriveItem = serde_json::from_slice(&response.body)
         .map_err(|e| format!("failed to parse drive item: {e}"))?;
@@ -355,11 +776,7 @@ pub fn children(config: &Config, path: &str) -> Result<Vec<GraphItem>, String> {
     loop {
         let response = graph_request(config, Method::Get, &url, None, &[])?;
         if response.status != 200 {
-            return Err(format!(
-                "graph children failed with status {}: {}",
-                response.status,
-                String::from_utf8_lossy(&response.body)
-            ));
+            return Err(graph_failure("Folder listing", &response));
         }
         let page: DriveItemPage = serde_json::from_slice(&response.body)
             .map_err(|e| format!("failed to parse children page: {e}"))?;
@@ -417,12 +834,10 @@ pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
                 .ok_or_else(|| "graph get_content redirect missing Location header".to_string())?;
             let location = location.trim();
             if !is_https_url(location) {
-                return Err(format!(
-                    "graph get_content redirect is not https: {location}"
-                ));
+                return Err("Graph content redirect must use HTTPS".into());
             }
 
-            let redirected = http_client::send(HttpRequest {
+            let redirected = send_with_read_retry(HttpRequest {
                 method: Method::Get,
                 url: &location,
                 headers: &[],
@@ -436,25 +851,25 @@ pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
             }
             Ok(redirected.body)
         }
-        _ => Err(format!(
-            "graph get_content failed with status {}",
-            response.status
-        )),
+        _ => Err(graph_failure("Content download", &response)),
     }
 }
 
-pub fn put_content(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaItem>, String> {
-    if bytes.len() as u64 > MAX_UPLOAD_BYTES {
+pub fn put_content(
+    config: &Config,
+    path: &str,
+    upload: &crate::upload::Upload,
+) -> Result<Option<DeltaItem>, String> {
+    if upload.size > config.max_upload_bytes {
         return Err(format!(
             "file is {} bytes, larger than this build's {}-byte upload limit",
-            bytes.len(),
-            MAX_UPLOAD_BYTES
+            upload.size, config.max_upload_bytes
         ));
     }
-    if bytes.len() as u64 > MAX_SIMPLE_UPLOAD_BYTES {
-        return put_chunked(config, path, bytes);
+    if upload.size > MAX_SIMPLE_UPLOAD_BYTES {
+        return put_chunked(config, path, upload);
     }
-    put_simple(config, path, bytes)
+    put_simple(config, path, &upload.read(0, upload.size as usize)?)
 }
 
 fn put_simple(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaItem>, String> {
@@ -470,11 +885,7 @@ fn put_simple(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaI
         bytes,
     )?;
     if response.status != 200 && response.status != 201 {
-        return Err(format!(
-            "graph put_content failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Content upload", &response));
     }
     Ok(serde_json::from_slice::<DriveItem>(&response.body)
         .ok()
@@ -487,7 +898,11 @@ struct UploadSession {
     upload_url: String,
 }
 
-fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaItem>, String> {
+fn put_chunked(
+    config: &Config,
+    path: &str,
+    upload: &crate::upload::Upload,
+) -> Result<Option<DeltaItem>, String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}/createUploadSession",
         item_path_segment(&config.drive_base, path)
@@ -505,11 +920,7 @@ fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<Delta
         body.to_string().as_bytes(),
     )?;
     if response.status != 200 && response.status != 201 {
-        return Err(format!(
-            "graph createUploadSession failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Upload session creation", &response));
     }
     let session: UploadSession = serde_json::from_slice(&response.body)
         .map_err(|e| format!("failed to parse upload session: {e}"))?;
@@ -518,59 +929,79 @@ fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<Delta
         return Err("graph createUploadSession returned a non-https uploadUrl".to_string());
     }
 
-    let total = bytes.len();
-    let mut offset = 0;
-    let result = (|| {
-        let mut last_item = None;
-        while offset < total {
-            let end = (offset + UPLOAD_CHUNK_BYTES).min(total);
-            let chunk = &bytes[offset..end];
-            let range = format!("bytes {offset}-{}/{}", end - 1, total);
+    let result = upload_chunks(
+        upload.size,
+        |offset, len| upload.read(offset, len),
+        |chunk, range| {
             let content_length = chunk.len().to_string();
-            let sent = http_client::send(HttpRequest {
+            http_client::send(HttpRequest {
                 method: Method::Put,
                 url: &upload_url,
                 headers: &[
-                    ("content-range", range.as_str()),
+                    ("content-range", range),
                     ("content-length", content_length.as_str()),
                     ("content-type", "application/octet-stream"),
                 ],
                 body: chunk,
-            })?;
-            let last = end == total;
-            let ok = if last {
-                sent.status == 200 || sent.status == 201
-            } else {
-                sent.status == 202
-            };
-            if !ok {
-                return Err(format!(
-                    "graph upload session chunk {}-{} failed with status {}: {}",
-                    offset,
-                    end - 1,
-                    sent.status,
-                    String::from_utf8_lossy(&sent.body)
-                ));
-            }
-            if last {
-                last_item = serde_json::from_slice::<DriveItem>(&sent.body)
-                    .ok()
-                    .and_then(|item| to_delta_item(&item));
-            }
-            offset = end;
-        }
-        Ok(last_item)
-    })();
+            })
+        },
+    );
 
     if result.is_err() {
-        let _ = http_client::send(HttpRequest {
+        match http_client::send(HttpRequest {
             method: Method::Delete,
             url: &upload_url,
             headers: &[],
             body: &[],
-        });
+        }) {
+            Ok(response) if matches!(response.status, 204 | 404) => {}
+            _ => {
+                return Err(format!(
+                    "{}; upload-session cancellation failed; unused session will expire",
+                    result.unwrap_err()
+                ));
+            }
+        }
     }
     result
+}
+
+fn upload_chunks(
+    total: u64,
+    mut read: impl FnMut(u64, usize) -> Result<Vec<u8>, String>,
+    mut send: impl FnMut(&[u8], &str) -> Result<http_client::HttpResponse, String>,
+) -> Result<Option<DeltaItem>, String> {
+    let mut offset = 0;
+    while offset < total {
+        let len = (total - offset).min(UPLOAD_CHUNK_BYTES as u64) as usize;
+        let chunk = read(offset, len)?;
+        if chunk.len() != len {
+            return Err("upload spool returned an incomplete chunk".into());
+        }
+        let end = offset + len as u64;
+        let response = send(&chunk, &format!("bytes {offset}-{}/{total}", end - 1))?;
+        if end == total {
+            if !matches!(response.status, 200 | 201) {
+                return Err(graph_failure("Upload session completion", &response));
+            }
+            let item: DriveItem = serde_json::from_slice(&response.body).map_err(|_| {
+                "upload completed but Graph returned invalid item metadata".to_string()
+            })?;
+            return Ok(to_delta_item(&item));
+        }
+        if response.status != 202 {
+            return Err(graph_failure("Upload session chunk", &response));
+        }
+        let progress: serde_json::Value = serde_json::from_slice(&response.body)
+            .map_err(|_| "upload session returned invalid progress".to_string())?;
+        if progress["nextExpectedRanges"][0].as_str() != Some(&format!("{end}-")) {
+            return Err(
+                "upload session progress disagrees with transmitted bytes; upload cancelled".into(),
+            );
+        }
+        offset = end;
+    }
+    Err("empty upload session".into())
 }
 
 pub fn create_folder(
@@ -595,11 +1026,7 @@ pub fn create_folder(
         body.to_string().as_bytes(),
     )?;
     if response.status != 201 {
-        return Err(format!(
-            "graph create_folder failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Folder creation", &response));
     }
     Ok(serde_json::from_slice::<DriveItem>(&response.body)
         .ok()
@@ -613,10 +1040,7 @@ pub fn delete(config: &Config, path: &str) -> Result<(), String> {
     );
     let response = graph_request(config, Method::Delete, &url, None, &[])?;
     if response.status != 204 && response.status != 404 {
-        return Err(format!(
-            "graph delete failed with status {}",
-            response.status
-        ));
+        return Err(graph_failure("Item deletion", &response));
     }
     Ok(())
 }
@@ -652,11 +1076,7 @@ pub fn move_or_rename(
         body.to_string().as_bytes(),
     )?;
     if response.status != 200 {
-        return Err(format!(
-            "graph move_or_rename failed with status {}: {}",
-            response.status,
-            String::from_utf8_lossy(&response.body)
-        ));
+        return Err(graph_failure("Item move/rename", &response));
     }
     Ok(serde_json::from_slice::<DriveItem>(&response.body)
         .ok()
@@ -666,6 +1086,124 @@ pub fn move_or_rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_upload_is_bounded_aligned_and_sequential_with_short_final_chunk() {
+        let total = 65 * 1024 * 1024 + 17;
+        let mut offsets = vec![];
+        let mut ranges = vec![];
+        let result = upload_chunks(total, |offset, len| {
+            offsets.push(offset);
+            assert!(len <= UPLOAD_CHUNK_BYTES);
+            Ok(vec![42; len])
+        }, |bytes, range| {
+            ranges.push(range.to_string());
+            assert!(bytes.iter().all(|byte| *byte == 42));
+            let end = range.split(['-', '/']).nth(1).unwrap().parse::<u64>().unwrap() + 1;
+            let last = end == total;
+            if !last {
+                assert_eq!(bytes.len() % (320 * 1024), 0);
+            }
+            Ok(http_client::HttpResponse {
+                status: if last { 201 } else { 202 }, headers: vec![],
+                body: if last {
+                    br#"{"id":"uploaded","name":"fixture","size":68157457,"file":{},"parentReference":{"id":"root"}}"#.to_vec()
+                } else {
+                    format!(r#"{{"nextExpectedRanges":["{end}-"]}}"#).into_bytes()
+                },
+            })
+        }).unwrap();
+        assert!(result.is_some());
+        assert_eq!(offsets.len(), 7);
+        assert_eq!(offsets[6], 60 * 1024 * 1024);
+        assert_eq!(
+            ranges[6],
+            format!("bytes {}-{}/{total}", offsets[6], total - 1)
+        );
+    }
+
+    #[test]
+    fn upload_failures_stop_without_unsafe_replay() {
+        for status in [429, 500, 503, 200] {
+            let mut requests = 0;
+            let result = upload_chunks(
+                UPLOAD_CHUNK_BYTES as u64 + 1,
+                |_, len| Ok(vec![0; len]),
+                |_, _| {
+                    requests += 1;
+                    Ok(http_client::HttpResponse {
+                        status,
+                        headers: vec![],
+                        body: b"{}".to_vec(),
+                    })
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(requests, 1);
+        }
+        let mut requests = 0;
+        let result = upload_chunks(
+            1,
+            |_, _| Ok(vec![]),
+            |_, _| {
+                requests += 1;
+                unreachable!()
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(requests, 0);
+    }
+
+    #[test]
+    fn unexpected_upload_progress_and_invalid_completion_are_errors() {
+        for (total, status, body) in [
+            (
+                UPLOAD_CHUNK_BYTES as u64 + 1,
+                202,
+                br#"{"nextExpectedRanges":["0-"]}"#.as_slice(),
+            ),
+            (1, 201, b"not-json".as_slice()),
+        ] {
+            assert!(
+                upload_chunks(
+                    total,
+                    |_, len| Ok(vec![0; len]),
+                    |_, _| {
+                        Ok(http_client::HttpResponse {
+                            status,
+                            headers: vec![],
+                            body: body.to_vec(),
+                        })
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn enterprise_errors_are_actionable_without_echoing_payloads() {
+        for (status, expected) in [
+            (401, "Sign in again"),
+            (403, "Access denied"),
+            (404, "not found"),
+        ] {
+            let response = http_client::HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: br#"{"error":{"code":"private-code","message":"private-token"}}"#.to_vec(),
+            };
+            let error = graph_failure("Fixture", &response);
+            assert!(error.contains(expected));
+            assert!(!error.contains("private"));
+        }
+        let response = http_client::HttpResponse {
+            status: 403,
+            headers: Vec::new(),
+            body: br#"{"error":{"code":"insufficient_claims","message":"private-token"}}"#.to_vec(),
+        };
+        assert!(graph_failure("Fixture", &response).contains("Conditional access"));
+    }
 
     #[test]
     fn parses_iso8601_utc() {
@@ -699,7 +1237,7 @@ mod tests {
     #[test]
     fn drive_root_segment_supports_explicit_drive_id() {
         assert_eq!(
-            drive_root_segment("B087983F641B9ED3"),
+            drive_root_segment("drives/B087983F641B9ED3"),
             "/drives/B087983F641B9ED3"
         );
     }
@@ -746,7 +1284,7 @@ mod tests {
         );
         assert_eq!(parent_reference_path("me/drive", "/"), "/me/drive/root:");
         assert_eq!(
-            parent_reference_path("B087983F641B9ED3", "/Documents"),
+            parent_reference_path("drives/B087983F641B9ED3", "/Documents"),
             "/drives/B087983F641B9ED3/root:/Documents"
         );
     }
@@ -789,5 +1327,69 @@ mod tests {
             br#"{"error":{"code":"resyncRequired","message":"go again"}}"#
         ));
         assert!(!is_resync(400, br#"{"error":{"code":"invalidRequest"}}"#));
+    }
+
+    #[test]
+    fn parses_sharepoint_site_urls() {
+        assert_eq!(
+            parse_sharepoint_site_url("https://tenant.sharepoint.com/sites/Engineering").unwrap(),
+            (
+                "tenant.sharepoint.com".to_string(),
+                "/sites/Engineering".to_string()
+            )
+        );
+        assert!(parse_sharepoint_site_url("http://tenant.sharepoint.com/sites/x").is_err());
+        assert!(parse_sharepoint_site_url("https://example.com/sites/x").is_err());
+    }
+
+    #[test]
+    fn owner_label_prefers_display_name() {
+        let label = owner_label(&[
+            Some(IdentitySet {
+                user: Some(Identity {
+                    display_name: Some("Ada Lovelace".into()),
+                    user_principal_name: Some("ada@example.com".into()),
+                }),
+                application: None,
+            }),
+            None,
+        ]);
+        assert_eq!(label, "Ada Lovelace");
+    }
+
+    #[test]
+    fn read_retry_delays_are_bounded_and_not_shortened() {
+        assert_eq!(retry_delay(None, 0).unwrap(), 1);
+        assert_eq!(retry_delay(Some("0"), 0).unwrap(), 0);
+        assert_eq!(retry_delay(Some("10"), 0).unwrap(), 10);
+        assert!(retry_delay(Some("11"), 0).is_err());
+        assert!(retry_delay(Some("invalid"), 0).is_err());
+        assert_eq!(
+            retry_delay(Some("Wed, 21 Oct 2015 07:28:00 GMT"), 1445412475).unwrap(),
+            5
+        );
+        assert_eq!(
+            retry_delay(Some("Wed, 21 Oct 2015 07:28:00 GMT"), 1445412481).unwrap(),
+            0
+        );
+        assert!(retry_delay(Some("Wed, 31 Feb 2015 07:28:00 GMT"), 0).is_err());
+    }
+
+    #[test]
+    fn business_and_channel_library_paths_are_encoded() {
+        assert_eq!(
+            item_path_segment("drives/b!fixture", "/100% complete #2026/Report.docx"),
+            "/drives/b%21fixture/root:/100%25%20complete%20%232026/Report.docx:"
+        );
+        assert_eq!(
+            item_path_segment("drives/b!abc-123_X", "/Shared files/a.docx"),
+            "/drives/b%21abc-123_X/root:/Shared%20files/a.docx:"
+        );
+        assert_eq!(
+            item_path_segment("sites/tenant.sharepoint.com,site,web/drive", "/"),
+            "/sites/tenant.sharepoint.com%2Csite%2Cweb/drive/root"
+        );
+        assert!(parse_sharepoint_site_url("https://user@tenant.sharepoint.com/sites/x").is_err());
+        assert!(parse_sharepoint_site_url("https://tenant.sharepoint.com/sites/../x").is_err());
     }
 }

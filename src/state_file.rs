@@ -1,7 +1,22 @@
 //! Small helpers for reading/writing a single file inside the preopened
 //! `/state` directory (used to persist `token.json`).
 
-use crate::bindings::wasi::filesystem::types::{Descriptor, DescriptorFlags, OpenFlags, PathFlags};
+use crate::bindings::wasi::filesystem::types::{
+    Descriptor, DescriptorFlags, ErrorCode, OpenFlags, PathFlags,
+};
+
+pub fn exists(dir: &Descriptor, name: &str) -> Result<bool, String> {
+    match dir.open_at(
+        PathFlags::empty(),
+        name,
+        OpenFlags::empty(),
+        DescriptorFlags::READ,
+    ) {
+        Ok(_) => Ok(true),
+        Err(ErrorCode::NoEntry) => Ok(false),
+        Err(error) => Err(format!("cannot inspect state file: {error:?}")),
+    }
+}
 
 pub fn read_file(dir: &Descriptor, name: &str) -> Result<Option<Vec<u8>>, String> {
     let file = match dir.open_at(
@@ -11,7 +26,8 @@ pub fn read_file(dir: &Descriptor, name: &str) -> Result<Option<Vec<u8>>, String
         DescriptorFlags::READ,
     ) {
         Ok(f) => f,
-        Err(_) => return Ok(None), // treat "doesn't exist" (and any open error) as "no state yet"
+        Err(ErrorCode::NoEntry) => return Ok(None),
+        Err(error) => return Err(format!("failed opening {name}: {error:?}")),
     };
 
     let mut contents = Vec::new();
@@ -70,7 +86,8 @@ pub fn read_at(
         DescriptorFlags::READ,
     ) {
         Ok(f) => f,
-        Err(_) => return Ok(None),
+        Err(ErrorCode::NoEntry) => return Ok(None),
+        Err(error) => return Err(format!("failed opening {name}: {error:?}")),
     };
 
     let mut contents = Vec::new();
@@ -107,4 +124,11 @@ pub fn write_atomic(dir: &Descriptor, name: &str, contents: &[u8]) -> Result<(),
 pub fn rename(dir: &Descriptor, from: &str, to: &str) -> Result<(), String> {
     dir.rename_at(from, dir, to)
         .map_err(|e| format!("failed renaming {from} -> {to}: {e:?}"))
+}
+
+pub fn remove_file(dir: &Descriptor, name: &str) -> Result<(), String> {
+    match dir.unlink_file_at(name) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(format!("failed removing {name}: {e:?}")),
+    }
 }

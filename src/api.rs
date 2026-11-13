@@ -12,41 +12,93 @@ use crate::sync_stats;
 use crate::xml;
 
 pub fn status(config: &Config) -> DavResponse {
+    let (credential_present, token_expires_in) = match crate::auth::credential_status(config) {
+        Ok(status) => status,
+        Err(error) => return status_json(config, serde_json::json!({"ok": false, "error": error})),
+    };
+    let failure = match sync_stats::load_failure(config) {
+        Ok(failure) => failure,
+        Err(error) => return status_json(config, serde_json::json!({"ok": false, "error": error})),
+    };
     if !config.index_enabled {
-        return json_ok(serde_json::json!({
-            "ok": true,
-            "indexEnabled": false,
-        }));
+        return status_json(
+            config,
+            serde_json::json!({
+                "ok": true,
+                "indexEnabled": false,
+                "credentialPresent": credential_present,
+                "tokenExpiresInSec": token_expires_in,
+                "lastSyncError": failure.as_ref().map(|failure| &failure.error),
+                "lastSyncErrorAt": failure.as_ref().map(|failure| failure.at),
+            }),
+        );
     }
-
     let meta = match snapshot::read_meta(&config.state_dir) {
-        Ok(m) => m,
-        Err(e) => {
-            return json_ok(serde_json::json!({
+        Ok(meta) => meta,
+        Err(error) => return status_json(config, serde_json::json!({"ok": false, "error": error})),
+    };
+    if !config.cache_current() {
+        return status_json(
+            config,
+            serde_json::json!({
                 "ok": true,
                 "indexEnabled": true,
-                "error": e,
-            }));
-        }
-    };
+                "present": false,
+                "accessVerified": false,
+                "reindexRequired": true,
+                "crawlComplete": false,
+                "credentialPresent": credential_present,
+                "tokenExpiresInSec": token_expires_in,
+                "lastSyncError": failure.as_ref().map(|failure| &failure.error),
+                "lastSyncErrorAt": failure.as_ref().map(|failure| failure.at),
+            }),
+        );
+    }
+
     let last_tick = match sync_stats::load(&config.state_dir) {
-        Ok(s) => s,
-        Err(_) => None,
+        Ok(tick) => tick.filter(|tick| {
+            meta.as_ref()
+                .and_then(|meta| meta.binding.as_ref())
+                .is_some_and(|binding| tick.matches_binding(binding))
+        }),
+        Err(error) => return status_json(config, serde_json::json!({"ok": false, "error": error})),
     };
+    let rebuilding = last_tick
+        .as_ref()
+        .is_some_and(|tick| tick.target == snapshot::REBUILD_FILE && !tick.complete);
 
     let mut body = serde_json::json!({
         "ok": true,
         "indexEnabled": true,
         "present": meta.is_some(),
+        "accessVerified": true,
+        "reindexRequired": false,
+        "rebuildInProgress": rebuilding,
+        "credentialPresent": credential_present,
+        "tokenExpiresInSec": token_expires_in,
+        "lastSyncError": failure.as_ref().map(|failure| &failure.error),
+        "lastSyncErrorAt": failure.as_ref().map(|failure| failure.at),
     });
     if let Some(meta) = meta {
-        body["crawlComplete"] = serde_json::json!(meta.crawl_complete);
+        body["crawlComplete"] = serde_json::json!(meta.crawl_complete && !rebuilding);
         body["hasToken"] = serde_json::json!(meta.delta_token.is_some());
         body["generation"] = serde_json::json!(meta.generation);
+        body["namespaceRevision"] = serde_json::json!(meta.namespace_revision.to_string());
         body["builtAt"] = serde_json::json!(meta.built_at);
         body["totalDirs"] = serde_json::json!(meta.total_dirs);
         body["totalFiles"] = serde_json::json!(meta.total_files);
         body["pendingNextLink"] = serde_json::json!(meta.pending_next_link.is_some());
+        if let Some(binding) = meta.binding {
+            body["drive"] = serde_json::json!({
+                "tenantId": binding.tenant_id,
+                "selector": binding.drive_base,
+                "id": binding.drive_id,
+                "name": binding.drive_name,
+                "type": binding.drive_type,
+                "webUrl": binding.web_url,
+                "owner": binding.owner_label,
+            });
+        }
     }
     if let Some(tick) = last_tick {
         body["lastTick"] = serde_json::json!({
@@ -54,12 +106,127 @@ pub fn status(config: &Config) -> DavResponse {
             "pages": tick.pages,
             "complete": tick.complete,
             "durationMs": tick.duration_ms,
+            "timings": tick.timings,
             "resync": tick.resync,
             "itemsPerSec": tick.items_per_sec,
             "at": tick.at,
         });
     }
-    json_ok(body)
+    status_json(config, body)
+}
+
+fn status_json(config: &Config, mut body: serde_json::Value) -> DavResponse {
+    match crate::cooldown::load(config) {
+        Ok(cooldown) => {
+            body["capabilities"] =
+                serde_json::json!({"persistedGraphCooldown": cooldown.is_some()});
+            body["cooldown"] = serde_json::json!(cooldown);
+            json_ok(body)
+        }
+        Err(error) => json_ok(serde_json::json!({"ok": false, "error": error})),
+    }
+}
+
+pub fn libraries(config: &Config, query: Option<&str>) -> DavResponse {
+    let group_id = query_param(query, "groupId");
+    let site_id = query_param(query, "siteId");
+    let site_url = query_param(query, "siteUrl");
+
+    let scope_count = group_id.is_some() as u8 + site_id.is_some() as u8 + site_url.is_some() as u8;
+    if scope_count > 1 {
+        return json_ok(serde_json::json!({
+            "ok": false,
+            "error": "specify at most one of groupId, siteId, or siteUrl",
+        }));
+    }
+
+    let (scope_name, resolved_site, libraries) = if let Some(group_id) = group_id.as_deref() {
+        (
+            "group",
+            None,
+            graph::list_libraries(config, graph::LibraryScope::Group(group_id)),
+        )
+    } else if let Some(site_id) = site_id.as_deref() {
+        (
+            "site",
+            None,
+            graph::list_libraries(config, graph::LibraryScope::Site(site_id)),
+        )
+    } else if let Some(site_url) = site_url.as_deref() {
+        match graph::resolve_site_by_url(config, site_url) {
+            Ok(site) => {
+                let site_id = site.id.clone();
+                (
+                    "siteUrl",
+                    Some(site),
+                    graph::list_libraries(config, graph::LibraryScope::Site(&site_id)),
+                )
+            }
+            Err(error) => {
+                return json_ok(serde_json::json!({
+                    "ok": false,
+                    "error": error,
+                }));
+            }
+        }
+    } else {
+        (
+            "me",
+            None,
+            graph::list_libraries(config, graph::LibraryScope::Me),
+        )
+    };
+
+    match libraries {
+        Ok(libraries) => json_ok(serde_json::json!({
+            "ok": true,
+            "scope": scope_name,
+            "resolvedSite": resolved_site.as_ref().map(|site| serde_json::json!({
+                "id": site.id,
+                "displayName": site.display_name,
+                "webUrl": site.web_url,
+                "hostname": site.hostname,
+                "path": site.path,
+            })),
+            "libraries": libraries.into_iter().map(|library| serde_json::json!({
+                "selector": library.selector,
+                "id": library.drive_id,
+                "name": library.drive_name,
+                "type": library.drive_type,
+                "webUrl": library.web_url,
+                "owner": library.owner_label,
+            })).collect::<Vec<_>>(),
+        })),
+        Err(error) => json_ok(serde_json::json!({
+            "ok": false,
+            "error": error,
+        })),
+    }
+}
+
+pub fn resolve(config: &Config, query: Option<&str>) -> DavResponse {
+    let raw = query_param(query, "selector").unwrap_or_default();
+    let selector = match crate::config::normalize_drive_base(&raw) {
+        Ok(selector) => selector,
+        Err(error) => return DavResponse::error(400, error),
+    };
+    match graph::resolve_drive(config, &selector) {
+        Ok(binding) => json_ok(serde_json::json!({
+            "ok": true,
+            "drive": {
+                "accountId": binding.account_id,
+                "credentialId": binding.credential_id,
+                "tenantId": binding.tenant_id,
+                "selector": format!("drives/{}", binding.drive_id),
+                "id": binding.drive_id,
+                "name": binding.drive_name,
+                "type": binding.drive_type,
+                "webUrl": binding.web_url,
+                "owner": binding.owner_label,
+            }
+        })),
+        Err(error) => DavResponse::error(502, error),
+    }
 }
 
 const SEARCH_MAX_RESULTS: usize = 100;
@@ -68,7 +235,7 @@ const SEARCH_MIN_QUERY_LEN: usize = 2;
 pub fn search(config: &Config, query: Option<&str>) -> DavResponse {
     let q = query_param(query, "q").unwrap_or_default();
 
-    if !config.index_enabled {
+    if !config.cache_current() {
         return json_ok(serde_json::json!({"ok": true, "ready": false}));
     }
 
@@ -130,19 +297,26 @@ fn search_index(index: &index::Index, q: &str) -> serde_json::Value {
     })
 }
 
-pub fn tree(config: &Config, query: Option<&str>) -> DavResponse {
+pub fn tree(config: &Config, query: Option<&str>, cache_only: bool) -> DavResponse {
     let raw = query_param(query, "path").unwrap_or_else(|| "/".to_string());
-    let path = match crate::sanitize_path(&raw) {
+    let path = match crate::sanitize_decoded_path(&raw) {
         Ok(p) => p,
         Err(e) => return DavResponse::error(400, e),
     };
 
-    if config.index_enabled {
+    if config.cache_current() {
         match snapshot::lookup_file(&config.state_dir, &path) {
             Ok(Some(hit)) => return json_ok(lookup_to_tree(&path, hit, "index")),
             Ok(None) => {}
-            Err(_) => {}
+            Err(error) => return DavResponse::error(502, error),
         }
+    }
+
+    if cache_only {
+        return json_ok(serde_json::json!({
+            "ok": false,
+            "error": "Library index is updating; retry browsing when this folder is indexed",
+        }));
     }
 
     match graph_tree(config, &path) {
@@ -294,6 +468,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tree_query_paths_are_decoded_once_and_keep_sharepoint_percent_names() {
+        let decoded = query_param(Some("path=%2F100%25%20complete"), "path").unwrap();
+        assert_eq!(
+            crate::sanitize_decoded_path(&decoded).unwrap(),
+            "/100% complete"
+        );
+        let traversal = query_param(Some("path=%2F%2e%2e%2Fsecret"), "path").unwrap();
+        assert!(crate::sanitize_decoded_path(&traversal).is_err());
+    }
+
+    #[test]
     fn query_param_reads_path() {
         assert_eq!(
             query_param(Some("path=/Documents"), "path").as_deref(),
@@ -421,5 +606,17 @@ mod tests {
         let idx = sample_index();
         let out = search_index(&idx, "report");
         assert_eq!(out["truncated"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn query_param_reads_site_url() {
+        assert_eq!(
+            query_param(
+                Some("siteUrl=https%3A%2F%2Ftenant.sharepoint.com%2Fsites%2FEngineering"),
+                "siteUrl"
+            )
+            .as_deref(),
+            Some("https://tenant.sharepoint.com/sites/Engineering")
+        );
     }
 }

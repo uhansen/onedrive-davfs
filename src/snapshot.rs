@@ -8,7 +8,7 @@
 //!   meta JSON
 
 use crate::bindings::wasi::filesystem::types::Descriptor;
-use crate::index::{Index, ItemMeta, Node, normalize_path, parent_path};
+use crate::index::{DriveBinding, Index, ItemMeta, Node, normalize_path, parent_path};
 use crate::state_file;
 use serde::{Deserialize, Serialize};
 
@@ -21,10 +21,14 @@ const HEADER_LEN: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotMeta {
+    #[serde(default)]
+    pub binding: Option<DriveBinding>,
     pub delta_token: Option<String>,
     pub pending_next_link: Option<String>,
     pub crawl_complete: bool,
     pub generation: u64,
+    #[serde(default)]
+    pub namespace_revision: u64,
     pub built_at: u64,
     pub root_id: Option<String>,
     /// Directory count (including root), baked in at encode time so
@@ -141,10 +145,12 @@ pub fn encode(index: &Index) -> Result<Vec<u8>, String> {
     }
 
     let meta = SnapshotMeta {
+        binding: index.binding.clone(),
         delta_token: index.delta_token.clone(),
         pending_next_link: index.pending_next_link.clone(),
         crawl_complete: index.crawl_complete,
         generation: index.generation,
+        namespace_revision: index.namespace_revision,
         built_at: now_secs(),
         root_id: index.root.clone(),
         total_dirs: dirs.len() as u64,
@@ -172,10 +178,12 @@ pub fn decode(bytes: &[u8]) -> Result<Index, String> {
     let rows = parse_dir_table(table, dir_count)?;
 
     let mut index = Index {
+        binding: meta.binding,
         delta_token: meta.delta_token,
         pending_next_link: meta.pending_next_link,
         crawl_complete: meta.crawl_complete,
         generation: meta.generation,
+        namespace_revision: meta.namespace_revision,
         root: meta.root_id,
         ..Index::default()
     };
@@ -289,15 +297,18 @@ pub fn save(dir: &Descriptor, name: &str, index: &Index) -> Result<(), String> {
     state_file::write_atomic(dir, name, &bytes)
 }
 
-/// Patch the live snapshot in place. No-op if it is missing or unreadable.
-pub fn mutate(dir: &Descriptor, f: impl FnOnce(&mut Index) -> bool) {
+/// Patch and atomically publish a new namespace revision.
+pub fn mutate(dir: &Descriptor, f: impl FnOnce(&mut Index) -> bool) -> Result<(), String> {
     let mut idx = match load(dir, INDEX_FILE) {
         Ok(Some(i)) => i,
-        _ => return,
+        Ok(None) => return Err("live index is missing".into()),
+        Err(error) => return Err(error),
     };
     if f(&mut idx) {
-        let _ = save(dir, INDEX_FILE, &idx);
+        idx.advance_namespace()?;
+        save(dir, INDEX_FILE, &idx)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -552,6 +563,80 @@ fn parse_dir_table(data: &[u8], count: u32) -> Result<Vec<DirRow>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revisions_survive_same_second_changes_and_legacy_metadata() {
+        let mut idx = Index::default();
+        idx.apply(root());
+        idx.advance_namespace().unwrap();
+        let bytes = encode(&idx).unwrap();
+        let mut loaded = decode(&bytes).unwrap();
+        assert_eq!(loaded.namespace_revision, 1);
+        loaded.advance_namespace().unwrap();
+        assert_eq!(
+            decode(&encode(&loaded).unwrap())
+                .unwrap()
+                .namespace_revision,
+            2
+        );
+        let meta = serde_json::json!({
+            "binding": null, "delta_token": null, "pending_next_link": null,
+            "crawl_complete": true, "generation": 1, "built_at": 1,
+            "root_id": "r", "total_dirs": 1, "total_files": 0
+        });
+        let legacy: SnapshotMeta = serde_json::from_value(meta).unwrap();
+        assert_eq!(legacy.namespace_revision, 0);
+    }
+
+    #[test]
+    #[ignore = "isolated representative-index benchmark; run with --release --ignored --nocapture"]
+    fn benchmark_representative_snapshot() {
+        use crate::index::DeltaItem;
+        use std::time::Instant;
+        let mut index = Index::default();
+        for number in 0..34_416 {
+            let is_dir = number < 2_138;
+            index.apply(DeltaItem {
+                id: format!("item-{number}"),
+                parent_id: (number != 0).then(|| {
+                    if is_dir {
+                        "item-0".into()
+                    } else {
+                        format!("item-{}", 1 + (number - 2_138) % 2_137)
+                    }
+                }),
+                name: format!("synthetic-entry-{number}"),
+                deleted: false,
+                is_root: number == 0,
+                meta: crate::index::ItemMeta {
+                    is_dir,
+                    size: 100,
+                    mtime: 1,
+                    etag: "\"synthetic-etag-0123456789\"".into(),
+                },
+            });
+        }
+        let mut encode_ms = vec![];
+        let mut decode_ms = vec![];
+        let mut bytes = vec![];
+        for _ in 0..11 {
+            let start = Instant::now();
+            bytes = encode(&index).unwrap();
+            encode_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = Instant::now();
+            let decoded = decode(&bytes).unwrap();
+            decode_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(decoded.nodes.len(), 34_416);
+        }
+        encode_ms.sort_by(f64::total_cmp);
+        decode_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "synthetic_snapshot nodes=34416 bytes={} encode_median_ms={:.2} decode_median_ms={:.2}",
+            bytes.len(),
+            encode_ms[5],
+            decode_ms[5]
+        );
+    }
     use crate::index::{DeltaItem, Index, ItemMeta};
 
     fn root() -> DeltaItem {
@@ -573,6 +658,18 @@ mod tests {
     #[test]
     fn round_trip_preserves_tree_and_token() {
         let mut idx = Index {
+            binding: Some(DriveBinding {
+                account_id: "user-a".into(),
+                credential_id: "login-a".into(),
+                client_id: None,
+                tenant_id: "common".into(),
+                drive_base: "me/drive".into(),
+                drive_id: "drive-123".into(),
+                drive_name: "Documents".into(),
+                drive_type: "business".into(),
+                web_url: "https://tenant.sharepoint.com/personal/me/Documents".into(),
+                owner_label: "Ada Lovelace".into(),
+            }),
             generation: 3,
             crawl_complete: true,
             delta_token: Some(
@@ -613,6 +710,7 @@ mod tests {
         assert_eq!(out.resolve("/Docs/a.txt").as_deref(), Some("f"));
         assert_eq!(out.nodes.get("f").unwrap().meta.size, 9);
         assert_eq!(out.delta_token, idx.delta_token);
+        assert_eq!(out.binding, idx.binding);
         assert!(out.crawl_complete);
         assert_eq!(out.generation, 3);
         let (_off, _count, meta_off, meta_len) = parse_header(&bytes).unwrap();
@@ -620,6 +718,7 @@ mod tests {
         assert_eq!(meta.total_dirs, 2);
         assert_eq!(meta.total_files, 1);
         assert!(meta.built_at > 0);
+        assert_eq!(meta.binding, idx.binding);
 
         let hit = lookup_bytes(&bytes, "/Docs").unwrap().unwrap();
         match hit {

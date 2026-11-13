@@ -4,6 +4,7 @@ mod bindings;
 mod api;
 mod auth;
 mod config;
+mod cooldown;
 mod dav;
 mod graph;
 mod http_client;
@@ -12,6 +13,7 @@ mod snapshot;
 mod state_file;
 mod sync;
 mod sync_stats;
+mod upload;
 mod xml;
 
 use bindings::exports::wasi::http::incoming_handler::Guest;
@@ -25,10 +27,24 @@ use dav::DavResponse;
 
 struct Component;
 
-/// Reads the full request body, refusing to buffer more than `max_bytes`
-/// so an oversized `PUT` cannot exhaust memory before the size check in
-/// `dav::put` runs. Returns `Err(BodyTooLarge)` past the limit.
-fn read_request_body(request: &IncomingRequest, max_bytes: u64) -> Result<Vec<u8>, BodyError> {
+/// Spools the body before creating a cloud upload session, including requests
+/// without Content-Length. The unlinked descriptor is closed on failure/trap.
+fn read_request_body(
+    request: &IncomingRequest,
+    config: &Config,
+) -> Result<upload::Upload, BodyError> {
+    let expected = match header_value(&request.headers(), "content-length") {
+        Some(value) => Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| BodyError::Read("invalid Content-Length".into()))?,
+        ),
+        None => None,
+    };
+    if expected.is_some_and(|size| size > config.max_upload_bytes) {
+        return Err(BodyError::TooLarge);
+    }
+    let mut spool = upload::Upload::create(&config.state_dir).map_err(BodyError::Storage)?;
     let incoming_body = request
         .consume()
         .map_err(|_| BodyError::Read("failed to consume request body".to_string()))?;
@@ -36,7 +52,6 @@ fn read_request_body(request: &IncomingRequest, max_bytes: u64) -> Result<Vec<u8
         .stream()
         .map_err(|_| BodyError::Read("failed to open request body stream".to_string()))?;
 
-    let mut buf = Vec::new();
     loop {
         match stream.blocking_read(64 * 1024) {
             Ok(chunk) => {
@@ -45,10 +60,14 @@ fn read_request_body(request: &IncomingRequest, max_bytes: u64) -> Result<Vec<u8
                     bindings::wasi::io::poll::poll(&[&pollable]);
                     continue;
                 }
-                if (buf.len() + chunk.len()) as u64 > max_bytes {
+                if upload::check_size(spool.size, chunk.len() as u64, config.max_upload_bytes)
+                    .is_err()
+                {
                     return Err(BodyError::TooLarge);
                 }
-                buf.extend_from_slice(&chunk);
+                spool
+                    .append(&chunk, config.max_upload_bytes)
+                    .map_err(BodyError::Storage)?;
             }
             Err(bindings::wasi::io::streams::StreamError::Closed) => break,
             Err(e) => {
@@ -58,12 +77,16 @@ fn read_request_body(request: &IncomingRequest, max_bytes: u64) -> Result<Vec<u8
             }
         }
     }
-    Ok(buf)
+    if expected.is_some_and(|expected| expected != spool.size) {
+        return Err(BodyError::Read("incomplete upload body".into()));
+    }
+    Ok(spool)
 }
 
 enum BodyError {
     TooLarge,
     Read(String),
+    Storage(String),
 }
 
 /// Minimal base64 decoder (standard alphabet, `=` padding) -- just enough
@@ -145,6 +168,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// is ever forwarded into a Graph `root:/...:` address.
 pub(crate) fn sanitize_path(raw: &str) -> Result<String, String> {
     let decoded = xml::pct_decode(raw).ok_or("malformed percent-encoding in path")?;
+    sanitize_decoded_path(&decoded)
+}
+
+pub(crate) fn sanitize_decoded_path(decoded: &str) -> Result<String, String> {
     if decoded.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err("control characters are not allowed in paths".to_string());
     }
@@ -193,6 +220,20 @@ fn destination_path(raw: &str) -> Result<String, String> {
         return Err("Destination host must be loopback".to_string());
     }
     Ok(path.to_string())
+}
+
+fn destination_for_request(raw: &str, authority: Option<&str>) -> Result<String, String> {
+    if let Some((scheme, rest)) = raw.trim().split_once("://") {
+        let destination_authority = rest.split('/').next().unwrap_or("");
+        if scheme != "http"
+            || !authority.is_some_and(|source| source.eq_ignore_ascii_case(destination_authority))
+        {
+            return Err(
+                "cross-library MOVE is not supported; Destination must use this endpoint".into(),
+            );
+        }
+    }
+    destination_path(raw)
 }
 
 fn is_loopback_hostport(hostport: &str) -> bool {
@@ -312,8 +353,16 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
     {
         match raw_path.as_str() {
             "/_status" | "_status" => return api::status(&config),
-            "/_tree" | "_tree" => return api::tree(&config, query.as_deref()),
+            "/_tree" | "_tree" => {
+                return api::tree(
+                    &config,
+                    query.as_deref(),
+                    header_value(&headers, "x-onedrive-cache-only").as_deref() == Some("1"),
+                );
+            }
             "/_search" | "_search" => return api::search(&config, query.as_deref()),
+            "/_libraries" | "_libraries" => return api::libraries(&config, query.as_deref()),
+            "/_resolve" | "_resolve" => return api::resolve(&config, query.as_deref()),
             _ => {}
         }
     }
@@ -324,7 +373,9 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
     };
     let depth = header_value(&headers, "depth");
     let destination = match header_value(&headers, "destination") {
-        Some(d) => match destination_path(&d).and_then(|p| sanitize_path(&p)) {
+        Some(d) => match destination_for_request(&d, request.authority().as_deref())
+            .and_then(|p| sanitize_path(&p))
+        {
             Ok(p) => Some(p),
             Err(e) => return DavResponse::error(400, format!("bad Destination: {e}")),
         },
@@ -333,21 +384,30 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
 
     match request.method() {
         Method::Options => DavResponse::options(),
+        Method::Head if header_value(&headers, "x-onedrive-cache-only").as_deref() == Some("1") => {
+            dav::head_cached(&config, &path)
+        }
         Method::Head => dav::head(&config, &path),
         Method::Get => dav::get(&config, &path),
-        Method::Put => match read_request_body(request, graph::MAX_UPLOAD_BYTES) {
+        Method::Put => match read_request_body(request, &config) {
             Ok(body) => dav::put(&config, &path, &body),
             Err(BodyError::TooLarge) => DavResponse::error(
                 413,
                 format!(
                     "file exceeds the {} byte upload limit of this build",
-                    graph::MAX_UPLOAD_BYTES
+                    config.max_upload_bytes
                 ),
             ),
             Err(BodyError::Read(e)) => DavResponse::error(400, e),
+            Err(BodyError::Storage(e)) => DavResponse::error(507, e),
         },
         Method::Delete => dav::delete(&config, &path),
         Method::Other(m) => match m.as_str() {
+            "PROPFIND"
+                if header_value(&headers, "x-onedrive-cache-only").as_deref() == Some("1") =>
+            {
+                dav::propfind_cached(&config, &path, depth.as_deref())
+            }
             "PROPFIND" => dav::propfind(&config, &path, depth.as_deref()),
             "MKCOL" => dav::mkcol(&config, &path),
             "MOVE" => match destination {
@@ -430,5 +490,17 @@ mod tests {
         assert!(destination_path("http://evil.example/x").is_err());
         assert!(destination_path("https://graph.microsoft.com/x").is_err());
         assert_eq!(destination_path("http://127.0.0.1").unwrap(), "/");
+    }
+
+    #[test]
+    fn move_cannot_change_library_endpoint() {
+        assert_eq!(
+            destination_for_request("http://127.0.0.1:8765/docs", Some("127.0.0.1:8765")).unwrap(),
+            "/docs"
+        );
+        assert!(
+            destination_for_request("http://127.0.0.1:8766/docs", Some("127.0.0.1:8765")).is_err()
+        );
+        assert_eq!(destination_for_request("/docs", None).unwrap(), "/docs");
     }
 }
