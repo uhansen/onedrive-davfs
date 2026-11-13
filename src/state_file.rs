@@ -5,6 +5,19 @@ use crate::bindings::wasi::filesystem::types::{
     Descriptor, DescriptorFlags, ErrorCode, OpenFlags, PathFlags,
 };
 
+pub fn exists(dir: &Descriptor, name: &str) -> Result<bool, String> {
+    match dir.open_at(
+        PathFlags::empty(),
+        name,
+        OpenFlags::empty(),
+        DescriptorFlags::READ,
+    ) {
+        Ok(_) => Ok(true),
+        Err(ErrorCode::NoEntry) => Ok(false),
+        Err(error) => Err(format!("cannot inspect state file: {error:?}")),
+    }
+}
+
 pub fn read_file(dir: &Descriptor, name: &str) -> Result<Option<Vec<u8>>, String> {
     let file = match dir.open_at(
         PathFlags::empty(),

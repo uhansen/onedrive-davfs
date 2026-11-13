@@ -12,6 +12,7 @@ mod snapshot;
 mod state_file;
 mod sync;
 mod sync_stats;
+mod upload;
 mod xml;
 
 use bindings::exports::wasi::http::incoming_handler::Guest;
@@ -25,10 +26,24 @@ use dav::DavResponse;
 
 struct Component;
 
-/// Reads the full request body, refusing to buffer more than `max_bytes`
-/// so an oversized `PUT` cannot exhaust memory before the size check in
-/// `dav::put` runs. Returns `Err(BodyTooLarge)` past the limit.
-fn read_request_body(request: &IncomingRequest, max_bytes: u64) -> Result<Vec<u8>, BodyError> {
+/// Spools the body before creating a cloud upload session, including requests
+/// without Content-Length. The unlinked descriptor is closed on failure/trap.
+fn read_request_body(
+    request: &IncomingRequest,
+    config: &Config,
+) -> Result<upload::Upload, BodyError> {
+    let expected = match header_value(&request.headers(), "content-length") {
+        Some(value) => Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| BodyError::Read("invalid Content-Length".into()))?,
+        ),
+        None => None,
+    };
+    if expected.is_some_and(|size| size > config.max_upload_bytes) {
+        return Err(BodyError::TooLarge);
+    }
+    let mut spool = upload::Upload::create(&config.state_dir).map_err(BodyError::Storage)?;
     let incoming_body = request
         .consume()
         .map_err(|_| BodyError::Read("failed to consume request body".to_string()))?;
@@ -36,7 +51,6 @@ fn read_request_body(request: &IncomingRequest, max_bytes: u64) -> Result<Vec<u8
         .stream()
         .map_err(|_| BodyError::Read("failed to open request body stream".to_string()))?;
 
-    let mut buf = Vec::new();
     loop {
         match stream.blocking_read(64 * 1024) {
             Ok(chunk) => {
@@ -45,10 +59,14 @@ fn read_request_body(request: &IncomingRequest, max_bytes: u64) -> Result<Vec<u8
                     bindings::wasi::io::poll::poll(&[&pollable]);
                     continue;
                 }
-                if (buf.len() + chunk.len()) as u64 > max_bytes {
+                if upload::check_size(spool.size, chunk.len() as u64, config.max_upload_bytes)
+                    .is_err()
+                {
                     return Err(BodyError::TooLarge);
                 }
-                buf.extend_from_slice(&chunk);
+                spool
+                    .append(&chunk, config.max_upload_bytes)
+                    .map_err(BodyError::Storage)?;
             }
             Err(bindings::wasi::io::streams::StreamError::Closed) => break,
             Err(e) => {
@@ -58,12 +76,16 @@ fn read_request_body(request: &IncomingRequest, max_bytes: u64) -> Result<Vec<u8
             }
         }
     }
-    Ok(buf)
+    if expected.is_some_and(|expected| expected != spool.size) {
+        return Err(BodyError::Read("incomplete upload body".into()));
+    }
+    Ok(spool)
 }
 
 enum BodyError {
     TooLarge,
     Read(String),
+    Storage(String),
 }
 
 /// Minimal base64 decoder (standard alphabet, `=` padding) -- just enough
@@ -361,21 +383,30 @@ fn handle_request(request: &IncomingRequest) -> DavResponse {
 
     match request.method() {
         Method::Options => DavResponse::options(),
+        Method::Head if header_value(&headers, "x-onedrive-cache-only").as_deref() == Some("1") => {
+            dav::head_cached(&config, &path)
+        }
         Method::Head => dav::head(&config, &path),
         Method::Get => dav::get(&config, &path),
-        Method::Put => match read_request_body(request, graph::MAX_UPLOAD_BYTES) {
+        Method::Put => match read_request_body(request, &config) {
             Ok(body) => dav::put(&config, &path, &body),
             Err(BodyError::TooLarge) => DavResponse::error(
                 413,
                 format!(
                     "file exceeds the {} byte upload limit of this build",
-                    graph::MAX_UPLOAD_BYTES
+                    config.max_upload_bytes
                 ),
             ),
             Err(BodyError::Read(e)) => DavResponse::error(400, e),
+            Err(BodyError::Storage(e)) => DavResponse::error(507, e),
         },
         Method::Delete => dav::delete(&config, &path),
         Method::Other(m) => match m.as_str() {
+            "PROPFIND"
+                if header_value(&headers, "x-onedrive-cache-only").as_deref() == Some("1") =>
+            {
+                dav::propfind_cached(&config, &path, depth.as_deref())
+            }
             "PROPFIND" => dav::propfind(&config, &path, depth.as_deref()),
             "MKCOL" => dav::mkcol(&config, &path),
             "MOVE" => match destination {

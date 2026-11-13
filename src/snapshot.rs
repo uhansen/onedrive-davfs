@@ -556,6 +556,56 @@ fn parse_dir_table(data: &[u8], count: u32) -> Result<Vec<DirRow>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "isolated representative-index benchmark; run with --release --ignored --nocapture"]
+    fn benchmark_representative_snapshot() {
+        use crate::index::DeltaItem;
+        use std::time::Instant;
+        let mut index = Index::default();
+        for number in 0..34_416 {
+            let is_dir = number < 2_138;
+            index.apply(DeltaItem {
+                id: format!("item-{number}"),
+                parent_id: (number != 0).then(|| {
+                    if is_dir {
+                        "item-0".into()
+                    } else {
+                        format!("item-{}", 1 + (number - 2_138) % 2_137)
+                    }
+                }),
+                name: format!("synthetic-entry-{number}"),
+                deleted: false,
+                is_root: number == 0,
+                meta: crate::index::ItemMeta {
+                    is_dir,
+                    size: 100,
+                    mtime: 1,
+                    etag: "\"synthetic-etag-0123456789\"".into(),
+                },
+            });
+        }
+        let mut encode_ms = vec![];
+        let mut decode_ms = vec![];
+        let mut bytes = vec![];
+        for _ in 0..11 {
+            let start = Instant::now();
+            bytes = encode(&index).unwrap();
+            encode_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = Instant::now();
+            let decoded = decode(&bytes).unwrap();
+            decode_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(decoded.nodes.len(), 34_416);
+        }
+        encode_ms.sort_by(f64::total_cmp);
+        decode_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "synthetic_snapshot nodes=34416 bytes={} encode_median_ms={:.2} decode_median_ms={:.2}",
+            bytes.len(),
+            encode_ms[5],
+            decode_ms[5]
+        );
+    }
     use crate::index::{DeltaItem, Index, ItemMeta};
 
     fn root() -> DeltaItem {

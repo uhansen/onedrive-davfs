@@ -11,9 +11,9 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::{error, info, warn};
@@ -44,6 +44,133 @@ const CPU_EPOCH_DEADLINE_TICKS: u64 = 3000;
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTBOUND_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(300);
 const OUTBOUND_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(300);
+const OUTBOUND_IDLE_LIMIT: usize = 8;
+const OUTBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const OUTBOUND_CONNECTION_LIFETIME: Duration = Duration::from_secs(60);
+
+struct PerfTimer {
+    phase: &'static str,
+    class: &'static str,
+    start: Option<Instant>,
+}
+
+impl PerfTimer {
+    fn new(phase: &'static str, class: &'static str) -> Self {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled = *ENABLED
+            .get_or_init(|| std::env::var("ONEDRIVE_PERF_LOG").is_ok_and(|value| value == "1"));
+        Self {
+            phase,
+            class,
+            start: enabled.then(Instant::now),
+        }
+    }
+}
+
+impl Drop for PerfTimer {
+    fn drop(&mut self) {
+        if let Some(start) = self.start {
+            info!(
+                phase = self.phase,
+                class = self.class,
+                elapsed_us = start.elapsed().as_micros() as u64,
+                "onedrive performance"
+            );
+        }
+    }
+}
+
+type ConnectionIo = Pin<Box<dyn Future<Output = std::result::Result<(), hyper::Error>> + Send>>;
+
+struct PooledConnection {
+    sender: hyper::client::conn::http1::SendRequest<WasiBody>,
+    io: ConnectionIo,
+    peer: SocketAddr,
+    created: Instant,
+}
+
+struct IdleConnection {
+    host: String,
+    idle_since: Instant,
+    connection: PooledConnection,
+}
+
+// Connections are driven only by the WASI request/IO futures, never by detached
+// tasks. Only completely consumed responses can return their connection here.
+struct OutboundClient {
+    tls: Arc<rustls::ClientConfig>,
+    idle: Mutex<Vec<IdleConnection>>,
+    idle_per_host: usize,
+}
+
+impl OutboundClient {
+    fn new() -> Self {
+        // 0 disables reuse; tuning cannot grow the pool beyond its global cap.
+        let idle_per_host = std::env::var("ONEDRIVE_HTTP_POOL_IDLE_PER_HOST")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .min(4);
+        Self {
+            tls: Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore {
+                        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+                    })
+                    .with_no_client_auth(),
+            ),
+            idle: Mutex::new(Vec::new()),
+            idle_per_host,
+        }
+    }
+
+    async fn take(&self, host: &str, peer: SocketAddr) -> Option<PooledConnection> {
+        let mut connection = {
+            let mut idle = self.idle.lock().unwrap();
+            idle.retain(|entry| {
+                entry.idle_since.elapsed() < OUTBOUND_IDLE_TIMEOUT
+                    && entry.connection.created.elapsed() < OUTBOUND_CONNECTION_LIFETIME
+                    && !entry.connection.sender.is_closed()
+            });
+            let index = idle
+                .iter()
+                .position(|entry| entry.host == host && entry.connection.peer == peer)?;
+            idle.swap_remove(index).connection
+        };
+        // Check for idle peer closure before assigning a request. Never replay a
+        // failed request: even an apparently failed mutation may have succeeded.
+        let ready = std::future::poll_fn(|cx| {
+            let open = connection.io.as_mut().poll(cx).is_pending() && connection.sender.is_ready();
+            std::task::Poll::Ready(open)
+        })
+        .await;
+        ready.then_some(connection)
+    }
+
+    fn put(&self, host: String, connection: PooledConnection) {
+        if self.idle_per_host == 0
+            || connection.sender.is_closed()
+            || connection.created.elapsed() >= OUTBOUND_CONNECTION_LIFETIME
+        {
+            return;
+        }
+        let mut idle = self.idle.lock().unwrap();
+        idle.retain(|entry| {
+            entry.idle_since.elapsed() < OUTBOUND_IDLE_TIMEOUT
+                && entry.connection.created.elapsed() < OUTBOUND_CONNECTION_LIFETIME
+                && !entry.connection.sender.is_closed()
+        });
+        if idle.len() < OUTBOUND_IDLE_LIMIT
+            && idle.iter().filter(|entry| entry.host == host).count() < self.idle_per_host
+        {
+            idle.push(IdleConnection {
+                host,
+                idle_since: Instant::now(),
+                connection,
+            });
+        }
+    }
+}
 
 const GUEST_ENV_NAMES: &[&str] = &[
     "ONEDRIVE_CLIENT_ID",
@@ -54,6 +181,8 @@ const GUEST_ENV_NAMES: &[&str] = &[
     "ONEDRIVE_INDEX_ENABLED",
     "ONEDRIVE_SYNC_MAX_PAGES",
     "ONEDRIVE_SYNC_BUDGET_MS",
+    "ONEDRIVE_MAX_UPLOAD_BYTES",
+    "ONEDRIVE_PERF_LOG",
 ];
 
 #[derive(Clone, Debug)]
@@ -102,7 +231,11 @@ impl HostConfig {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "Usage: onedrive-davfs-host --component <path> --state-dir <path> [--account-dir <path>] [--addr {DEFAULT_ADDR}]"
+                        "Usage: onedrive-davfs-host --component <path> --state-dir <path> [--account-dir <path>] [--addr {DEFAULT_ADDR}]\n\
+                         Environment:\n\
+                         ONEDRIVE_PERF_LOG=1: privacy-safe stage timings (off by default)\n\
+                         ONEDRIVE_HTTP_POOL_IDLE_PER_HOST=0..4: idle connections per host (default 1; 0 disables reuse; global cap 8)\n\
+                         ONEDRIVE_CACHED_DAV_READS=1: allow cached HEAD/PROPFIND while busy (off by default; cache misses return 503 until the next sync)"
                     );
                     std::process::exit(0);
                 }
@@ -251,17 +384,23 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         || (segments[0] & 0xffc0) == 0xfec0)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct HttpPolicyHooks {
     policy: OutboundPolicy,
     read_only: bool,
+    client: Arc<OutboundClient>,
+    #[cfg(test)]
+    mock_peer: Option<SocketAddr>,
 }
 
 impl HttpPolicyHooks {
-    fn new(policy: OutboundPolicy) -> Self {
+    fn new(policy: OutboundPolicy, client: Arc<OutboundClient>) -> Self {
         Self {
             policy,
             read_only: false,
+            client,
+            #[cfg(test)]
+            mock_peer: None,
         }
     }
 }
@@ -288,7 +427,10 @@ impl WasiHttpHooks for HttpPolicyHooks {
             > + Send,
     > {
         let policy = self.policy.clone();
+        let client = self.client.clone();
         let read_only = self.read_only;
+        #[cfg(test)]
+        let mock_peer = self.mock_peer;
         let effective_options = RequestOptions {
             connect_timeout: options
                 .and_then(|o| o.connect_timeout)
@@ -305,8 +447,18 @@ impl WasiHttpHooks for HttpPolicyHooks {
             if read_only {
                 return Err(WasiHttpError::HttpRequestDenied);
             }
+            #[cfg(test)]
+            if let Some(peer) = mock_peer {
+                policy.validate_uri(request.uri())?;
+                let (response, io) = tests::send_mock_request(client, peer, request).await?;
+                return Ok((
+                    response,
+                    Box::new(io)
+                        as Box<dyn Future<Output = std::result::Result<(), WasiHttpError>> + Send>,
+                ));
+            }
             let (response, io) =
-                send_restricted_request(policy, request, effective_options).await?;
+                send_restricted_request(client, policy, request, effective_options).await?;
             Ok((
                 response,
                 Box::new(io)
@@ -317,8 +469,9 @@ impl WasiHttpHooks for HttpPolicyHooks {
 }
 
 async fn send_restricted_request(
+    client: Arc<OutboundClient>,
     policy: OutboundPolicy,
-    mut req: Request<WasiBody>,
+    req: Request<WasiBody>,
     options: RequestOptions,
 ) -> std::result::Result<
     (
@@ -327,6 +480,7 @@ async fn send_restricted_request(
     ),
     WasiHttpError,
 > {
+    let _outbound_timer = PerfTimer::new("outbound_headers", "outbound");
     let validated = policy.validate_uri(req.uri())?;
 
     let connect_timeout = options.connect_timeout.unwrap_or(OUTBOUND_CONNECT_TIMEOUT);
@@ -337,35 +491,79 @@ async fn send_restricted_request(
         .between_bytes_timeout
         .unwrap_or(OUTBOUND_BETWEEN_BYTES_TIMEOUT);
 
-    let connect_addr =
-        resolve_public_addr(&validated.host, validated.port, connect_timeout).await?;
-
-    let stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(connect_addr)).await
-    {
-        Ok(stream) => stream.map_err(WasiHttpError::Connect)?,
-        Err(..) => return Err(WasiHttpError::ConnectionTimeout),
+    // Revalidate DNS on every request, including reuse. An established TLS
+    // connection is reused only when its original public peer still matches.
+    let connect_addr = {
+        let _timer = PerfTimer::new("dns", "outbound");
+        resolve_public_addr(&validated.host, validated.port, connect_timeout).await?
     };
 
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-        })
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-    let server_name = rustls::pki_types::ServerName::try_from(validated.host.clone())
-        .map_err(WasiHttpError::from)?;
-    let tls_stream = connector
-        .connect(server_name, stream)
+    let connection = if let Some(connection) = client.take(&validated.host, connect_addr).await {
+        let _timer = PerfTimer::new("connection_reused", "outbound");
+        connection
+    } else {
+        let stream = {
+            let _timer = PerfTimer::new("tcp", "outbound");
+            tokio::time::timeout(connect_timeout, TcpStream::connect(connect_addr))
+                .await
+                .map_err(|_| WasiHttpError::ConnectionTimeout)?
+                .map_err(WasiHttpError::Connect)?
+        };
+        let connector = tokio_rustls::TlsConnector::from(client.tls.clone());
+        let server_name = rustls::pki_types::ServerName::try_from(validated.host.clone())
+            .map_err(WasiHttpError::from)?;
+        let tls_stream = {
+            let _timer = PerfTimer::new("tls", "outbound");
+            tokio::time::timeout(connect_timeout, connector.connect(server_name, stream))
+                .await
+                .map_err(|_| WasiHttpError::ConnectionTimeout)?
+                .map_err(WasiHttpError::Tls)?
+        };
+        let (sender, io) = tokio::time::timeout(
+            connect_timeout,
+            hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(tls_stream)),
+        )
         .await
-        .map_err(WasiHttpError::Tls)?;
-
-    let (mut sender, conn) = tokio::time::timeout(
-        connect_timeout,
-        hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(tls_stream)),
+        .map_err(|_| WasiHttpError::ConnectionTimeout)?
+        .map_err(WasiHttpError::from)?;
+        PooledConnection {
+            sender,
+            io: Box::pin(io),
+            peer: connect_addr,
+            created: Instant::now(),
+        }
+    };
+    send_on_connection(
+        client,
+        validated.host,
+        connection,
+        req,
+        first_byte_timeout,
+        between_bytes_timeout,
     )
     .await
-    .map_err(|_| WasiHttpError::ConnectionTimeout)?
-    .map_err(WasiHttpError::from)?;
+}
+
+async fn send_on_connection(
+    client: Arc<OutboundClient>,
+    host: String,
+    connection: PooledConnection,
+    mut req: Request<WasiBody>,
+    first_byte_timeout: Duration,
+    between_bytes_timeout: Duration,
+) -> std::result::Result<
+    (
+        Response<WasiBody>,
+        impl Future<Output = std::result::Result<(), WasiHttpError>> + Send,
+    ),
+    WasiHttpError,
+> {
+    let PooledConnection {
+        mut sender,
+        io,
+        peer,
+        created,
+    } = connection;
 
     *req.uri_mut() = http::Uri::builder()
         .path_and_query(
@@ -377,10 +575,12 @@ async fn send_restricted_request(
         .build()
         .map_err(|_| WasiHttpError::HttpRequestUriInvalid)?;
 
-    let send = async move {
+    let (body_done, body_finished) = oneshot::channel();
+    let send = async {
         struct IncomingResponseBody {
             incoming: hyper::body::Incoming,
             timeout: tokio::time::Interval,
+            done: Option<oneshot::Sender<()>>,
         }
 
         impl Body for IncomingResponseBody {
@@ -394,8 +594,14 @@ async fn send_restricted_request(
                 Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>,
             > {
                 match Pin::new(&mut self.as_mut().incoming).poll_frame(cx) {
-                    std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                    std::task::Poll::Ready(None) => {
+                        if let Some(done) = self.done.take() {
+                            let _ = done.send(());
+                        }
+                        std::task::Poll::Ready(None)
+                    }
                     std::task::Poll::Ready(Some(Err(err))) => {
+                        self.done.take();
                         let err = if err.is_timeout() {
                             WasiHttpError::HttpResponseTimeout
                         } else {
@@ -405,10 +611,16 @@ async fn send_restricted_request(
                     }
                     std::task::Poll::Ready(Some(Ok(frame))) => {
                         self.timeout.reset();
+                        if self.incoming.is_end_stream() {
+                            if let Some(done) = self.done.take() {
+                                let _ = done.send(());
+                            }
+                        }
                         std::task::Poll::Ready(Some(Ok(frame)))
                     }
                     std::task::Poll::Pending => match Pin::new(&mut self.timeout).poll_tick(cx) {
                         std::task::Poll::Ready(_) => {
+                            self.done.take();
                             std::task::Poll::Ready(Some(Err(WasiHttpError::ConnectionReadTimeout)))
                         }
                         std::task::Poll::Pending => std::task::Poll::Pending,
@@ -425,6 +637,7 @@ async fn send_restricted_request(
             }
         }
 
+        let _timer = PerfTimer::new("http_headers", "outbound");
         let res = tokio::time::timeout(first_byte_timeout, sender.send_request(req))
             .await
             .map_err(|_| WasiHttpError::ConnectionReadTimeout)?
@@ -438,13 +651,21 @@ async fn send_restricted_request(
         timeout.reset();
 
         Ok(res.map(|incoming| {
-            let body = IncomingResponseBody { incoming, timeout };
+            let mut done = Some(body_done);
+            if incoming.is_end_stream() {
+                let _ = done.take().unwrap().send(());
+            }
+            let body = IncomingResponseBody {
+                incoming,
+                timeout,
+                done,
+            };
             body.boxed_unsync()
         }))
     };
 
     let mut send = Box::pin(send);
-    let mut conn = Some(conn);
+    let mut conn = Some(io);
     let response = std::future::poll_fn(|cx| match send.as_mut().poll(cx) {
         std::task::Poll::Ready(Ok(resp)) => std::task::Poll::Ready(Ok(resp)),
         std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
@@ -452,8 +673,11 @@ async fn send_restricted_request(
             let Some(fut) = conn.as_mut() else {
                 return std::task::Poll::Pending;
             };
-            match Pin::new(fut).poll(cx) {
-                std::task::Poll::Ready(Ok(())) => send.as_mut().poll(cx),
+            match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(Ok(())) => {
+                    conn = None;
+                    send.as_mut().poll(cx)
+                }
                 std::task::Poll::Ready(Err(err)) => {
                     std::task::Poll::Ready(Err(WasiHttpError::from(err)))
                 }
@@ -462,10 +686,38 @@ async fn send_restricted_request(
         }
     })
     .await?;
+    drop(send);
 
     Ok((response, async move {
-        if let Some(conn) = conn.take() {
-            conn.await.map_err(WasiHttpError::from)?;
+        let _timer = PerfTimer::new("outbound_body", "outbound");
+        if let Some(mut io) = conn.take() {
+            let ready = {
+                let reusable = async {
+                    if body_finished.await.is_err() {
+                        return false;
+                    }
+                    sender.ready().await.is_ok()
+                };
+                tokio::pin!(reusable);
+                tokio::select! {
+                    ready = &mut reusable => ready,
+                    result = &mut io => {
+                        result.map_err(WasiHttpError::from)?;
+                        return Ok(());
+                    }
+                }
+            };
+            if ready {
+                client.put(
+                    host,
+                    PooledConnection {
+                        sender,
+                        io,
+                        peer,
+                        created,
+                    },
+                );
+            }
         }
         Ok(())
     }))
@@ -565,6 +817,10 @@ struct HostServer {
     execution_slot: Arc<Semaphore>,
     read_slots: Arc<Semaphore>,
     queued_waiters: AtomicUsize,
+    outbound: Arc<OutboundClient>,
+    cached_dav_reads: bool,
+    #[cfg(test)]
+    mock_peer: Option<SocketAddr>,
 }
 
 impl HostServer {
@@ -582,6 +838,11 @@ impl HostServer {
             execution_slot: Arc::new(Semaphore::new(1)),
             read_slots: Arc::new(Semaphore::new(2)),
             queued_waiters: AtomicUsize::new(0),
+            outbound: Arc::new(OutboundClient::new()),
+            cached_dav_reads: std::env::var("ONEDRIVE_CACHED_DAV_READS")
+                .is_ok_and(|value| value == "1"),
+            #[cfg(test)]
+            mock_peer: None,
         }
     }
 
@@ -623,8 +884,12 @@ impl HostServer {
             .trap_on_grow_failure(true)
             .build();
 
-        let mut hooks = HttpPolicyHooks::new(OutboundPolicy);
+        let mut hooks = HttpPolicyHooks::new(OutboundPolicy, self.outbound.clone());
         hooks.read_only = read_only;
+        #[cfg(test)]
+        {
+            hooks.mock_peer = self.mock_peer;
+        }
         let state = HostState {
             table: ResourceTable::new(),
             wasi: wasi.build(),
@@ -645,7 +910,13 @@ impl HostServer {
         mut req: Request<Incoming>,
     ) -> Result<Response<HyperOutgoingBody>> {
         req.headers_mut().remove("x-onedrive-cache-only");
-        let read_candidate = is_local_read(&req);
+        let class = if is_local_read(&req, self.cached_dav_reads) {
+            "local_read"
+        } else {
+            "serialized"
+        };
+        let queue_timer = PerfTimer::new("queue", class);
+        let read_candidate = is_local_read(&req, self.cached_dav_reads);
         let (admission, read_only) = if read_candidate {
             match self.execution_slot.clone().try_acquire_owned() {
                 Ok(permit) => (Ok(RequestAdmission { permit }), false),
@@ -682,7 +953,9 @@ impl HostServer {
                 ));
             }
         };
+        drop(queue_timer);
 
+        let credential_timer = PerfTimer::new("credential_acquire", class);
         let mut credentials = if read_only {
             req.headers_mut()
                 .insert("x-onedrive-cache-only", http::HeaderValue::from_static("1"));
@@ -696,6 +969,8 @@ impl HostServer {
                 .await?,
             )
         };
+        drop(credential_timer);
+        let store_timer = PerfTimer::new("store", class);
         let mut store = self.build_store(read_only)?;
         let req = store
             .data_mut()
@@ -710,9 +985,11 @@ impl HostServer {
             .map_err(|e| anyhow!("failed to create wasi:http response outparam: {e}"))?;
         let pre = self.pre.clone();
         let _permit = admission.into_permit();
+        drop(store_timer);
 
         let task = tokio::spawn(async move {
             let _permit = _permit;
+            let execute_timer = PerfTimer::new("execute", class);
             let proxy = pre
                 .instantiate_async(&mut store)
                 .await
@@ -722,7 +999,9 @@ impl HostServer {
                 .call_handle(store, req, out)
                 .await
                 .map_err(|e| anyhow!("component request failed: {e}"));
+            drop(execute_timer);
             if let Some(credentials) = credentials.as_mut() {
+                let _timer = PerfTimer::new("credential_publish", class);
                 credentials.publish()?;
             }
             result?;
@@ -762,14 +1041,18 @@ impl HostServer {
     }
 }
 
-fn is_local_read<B>(req: &Request<B>) -> bool {
-    req.method() == http::Method::GET
-        && ((req
-            .headers()
-            .get("x-onedrive-plugin")
-            .is_some_and(|value| value == "1")
-            && matches!(req.uri().path(), "/_status" | "/_search" | "/_tree"))
-            || (req.uri().path() == "/" && !req.headers().contains_key("authorization")))
+fn is_local_read<B>(req: &Request<B>, cached_dav_reads: bool) -> bool {
+    // The guest must treat cache-only metadata misses as misses, not network
+    // fallbacks. Read-only preopens and HTTP hooks enforce that boundary too.
+    (cached_dav_reads
+        && (req.method() == http::Method::HEAD || req.method().as_str() == "PROPFIND"))
+        || req.method() == http::Method::GET
+            && ((req
+                .headers()
+                .get("x-onedrive-plugin")
+                .is_some_and(|value| value == "1")
+                && matches!(req.uri().path(), "/_status" | "/_search" | "/_tree"))
+                || (req.uri().path() == "/" && !req.headers().contains_key("authorization")))
 }
 
 fn plain_response(status: StatusCode, message: &str) -> Response<HyperOutgoingBody> {
@@ -850,6 +1133,7 @@ async fn main() -> Result<()> {
 
     let config = HostConfig::parse()?;
     let _state_owner = credentials::lock_state(&config.state_dir)?;
+    let _upload_directory = credentials::prepare_upload_directory(&config.state_dir)?;
     let engine = build_engine()?;
     let pre = load_pre(&engine, &config.component_path).await?;
     let guest_env = GuestEnv::capture();
@@ -884,6 +1168,7 @@ async fn main() -> Result<()> {
             }
             accept = listener.accept() => {
                 let (client, addr) = accept.context("failed to accept connection")?;
+                tasks.retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
                 let server = server.clone();
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = http1::Builder::new()
@@ -936,10 +1221,12 @@ mod tests {
                 .header("authorization", "Basic fixture")
                 .body(())
                 .unwrap();
-            assert!(is_local_read(&request));
+            assert!(is_local_read(&request, false));
+            assert!(is_local_read(&request, true));
         }
         assert!(is_local_read(
-            &Request::builder().uri("/").body(()).unwrap()
+            &Request::builder().uri("/").body(()).unwrap(),
+            false,
         ));
         for (method, path, plugin, authorized) in [
             ("POST", "/_status", true, true),
@@ -948,6 +1235,8 @@ mod tests {
             ("GET", "/_status", false, true),
             ("GET", "/", false, true),
             ("GET", "/document", false, false),
+            ("GET", "/document", false, true),
+            ("PUT", "/document", false, true),
         ] {
             let mut request = Request::builder().method(method).uri(path);
             if plugin {
@@ -956,7 +1245,787 @@ mod tests {
             if authorized {
                 request = request.header("authorization", "Basic fixture");
             }
-            assert!(!is_local_read(&request.body(()).unwrap()));
+            let request = request.body(()).unwrap();
+            assert!(!is_local_read(&request, false));
+            assert!(!is_local_read(&request, true));
+        }
+    }
+
+    #[test]
+    fn cached_dav_metadata_reads_require_explicit_opt_in() {
+        for method in ["HEAD", "PROPFIND"] {
+            for path in ["/", "/document", "/_status"] {
+                for plugin in [false, true] {
+                    let mut request = Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("authorization", "Basic fixture");
+                    if plugin {
+                        request = request.header("x-onedrive-plugin", "1");
+                    }
+                    let request = request.body(()).unwrap();
+                    assert!(!is_local_read(&request, false));
+                    assert!(is_local_read(&request, true));
+                }
+            }
+        }
+    }
+
+    fn test_client(idle_per_host: usize) -> Arc<OutboundClient> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut client = OutboundClient::new();
+        client.idle_per_host = idle_per_host;
+        Arc::new(client)
+    }
+
+    struct TestServer {
+        peer: SocketAddr,
+        accepted: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl TestServer {
+        async fn start() -> Self {
+            Self::with_handler(|request: Request<Incoming>| async move {
+                let close = request.uri().path() == "/close";
+                let bytes = request.into_body().collect().await?.to_bytes();
+                let mut response = Response::new(Full::new(bytes));
+                if close {
+                    response.headers_mut().insert(
+                        http::header::CONNECTION,
+                        http::HeaderValue::from_static("close"),
+                    );
+                }
+                Ok::<_, hyper::Error>(response)
+            })
+            .await
+        }
+
+        async fn with_handler<F, Fut>(handler: F) -> Self
+        where
+            F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
+            Fut: Future<Output = std::result::Result<Response<Full<Bytes>>, hyper::Error>>
+                + Send
+                + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let peer = listener.local_addr().unwrap();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let count = accepted.clone();
+            let task = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (stream, _) = accepted.unwrap();
+                            count.fetch_add(1, Ordering::Relaxed);
+                            let handler = handler.clone();
+                            connections.spawn(async move {
+                                let _ = http1::Builder::new().serve_connection(
+                                    TokioIo::new(stream),
+                                    service_fn(handler),
+                                ).await;
+                            });
+                        }
+                        _ = connections.join_next(), if !connections.is_empty() => {}
+                    }
+                }
+            });
+            Self {
+                peer,
+                accepted,
+                task,
+            }
+        }
+
+        async fn connection(&self) -> PooledConnection {
+            let stream = TcpStream::connect(self.peer).await.unwrap();
+            let (sender, io) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream))
+                .await
+                .unwrap();
+            PooledConnection {
+                sender,
+                io: Box::pin(io),
+                peer: self.peer,
+                created: Instant::now(),
+            }
+        }
+
+        async fn round_trip(&self, client: &Arc<OutboundClient>, body: WasiBody) -> Bytes {
+            let connection = match client.take("graph.microsoft.com", self.peer).await {
+                Some(connection) => connection,
+                None => self.connection().await,
+            };
+            let request = Request::builder()
+                .method("POST")
+                .uri("https://graph.microsoft.com/echo?not-logged")
+                .header("host", "graph.microsoft.com")
+                .body(body)
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (response, io) = send_on_connection(
+                    client.clone(),
+                    "graph.microsoft.com".into(),
+                    connection,
+                    request,
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+                let (body, result) = tokio::join!(response.into_body().collect(), io);
+                result.unwrap();
+                body.unwrap().to_bytes()
+            })
+            .await
+            .expect("request body and connection IO must make progress")
+        }
+    }
+
+    fn test_body(bytes: &'static [u8]) -> WasiBody {
+        Full::new(Bytes::from_static(bytes))
+            .map_err(|never| match never {})
+            .boxed_unsync()
+    }
+
+    pub(super) async fn send_mock_request(
+        client: Arc<OutboundClient>,
+        peer: SocketAddr,
+        request: Request<WasiBody>,
+    ) -> std::result::Result<
+        (
+            Response<WasiBody>,
+            impl Future<Output = std::result::Result<(), WasiHttpError>> + Send,
+        ),
+        WasiHttpError,
+    > {
+        assert!(peer.ip().is_loopback());
+        let host = request.uri().host().unwrap().to_string();
+        let connection = match client.take(&host, peer).await {
+            Some(connection) => connection,
+            None => {
+                let stream = TcpStream::connect(peer)
+                    .await
+                    .map_err(WasiHttpError::Connect)?;
+                let (sender, io) = hyper::client::conn::http1::Builder::new()
+                    .handshake(TokioIo::new(stream))
+                    .await
+                    .map_err(WasiHttpError::from)?;
+                PooledConnection {
+                    sender,
+                    io: Box::pin(io),
+                    peer,
+                    created: Instant::now(),
+                }
+            }
+        };
+        send_on_connection(
+            client,
+            host,
+            connection,
+            request,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
+    #[derive(Default, Debug)]
+    struct MockGraphState {
+        sessions: usize,
+        cancellations: usize,
+        deltas: usize,
+        chunks: Vec<(String, usize)>,
+        bytes: usize,
+        active: usize,
+        max_active: usize,
+        failures: Vec<&'static str>,
+    }
+
+    struct ComponentFixture {
+        server: HostServer,
+        _graph: TestServer,
+        observed: Arc<Mutex<MockGraphState>>,
+        root: PathBuf,
+    }
+
+    impl Drop for ComponentFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl ComponentFixture {
+        async fn new(component_path: PathBuf, total: usize, fail_chunk: Option<usize>) -> Self {
+            static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!(
+                    "component-http-{}-{}",
+                    std::process::id(),
+                    SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                ));
+            std::fs::create_dir(&root).unwrap();
+            credentials::prepare_upload_directory(&root).unwrap();
+            std::fs::write(
+                root.join("token.json"),
+                br#"{"credential_id":"fixture-login","refresh_token":"fixture-refresh","access_token":"fixture-access","expires_at":4102444800}"#,
+            ).unwrap();
+            let observed = Arc::new(Mutex::new(MockGraphState::default()));
+            let state = observed.clone();
+            let uploads = root.join(".uploads");
+            let graph = TestServer::with_handler(move |request| {
+                let state = state.clone();
+                let uploads = uploads.clone();
+                async move {
+                    let (parts, mut body) = request.into_parts();
+                    let is_session = parts.uri.path() == "/upload-fixture";
+                    let is_upload = is_session && parts.method == http::Method::PUT;
+                    let offset = {
+                        let mut state = state.lock().unwrap();
+                        if is_session {
+                            if !matches!(parts.method, http::Method::PUT | http::Method::DELETE)
+                                || parts.headers.contains_key("authorization")
+                                || parts.headers.get("host").unwrap() != "upload.up.1drv.com"
+                            {
+                                state.failures.push("upload leaked authorization or used wrong destination/method");
+                            }
+                            if is_upload {
+                                state.active += 1;
+                                state.max_active = state.max_active.max(state.active);
+                            }
+                        } else if parts.headers.get("authorization")
+                            != Some(&http::HeaderValue::from_static("Bearer fixture-access"))
+                        {
+                            state.failures.push("Graph authorization missing");
+                        }
+                        state.bytes
+                    };
+                    let mut received = 0;
+                    let mut valid = true;
+                    while let Some(frame) = body.frame().await {
+                        if let Ok(data) = frame?.into_data() {
+                            if is_upload {
+                                valid &= data.iter().enumerate().all(|(index, byte)| {
+                                    *byte == ((offset + received + index) % 251) as u8
+                                });
+                            }
+                            received += data.len();
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    let mut state = state.lock().unwrap();
+                    let (status, json) = if is_upload {
+                        let expected_len = (total - offset).min(10 * 1024 * 1024);
+                        let expected_range = format!(
+                            "bytes {offset}-{}/{}", offset + expected_len - 1, total,
+                        );
+                        let range = parts.headers.get("content-range")
+                            .and_then(|value| value.to_str().ok()).unwrap_or("");
+                        let length = parts.headers.get("content-length")
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.parse::<usize>().ok());
+                        if !valid || received != expected_len || range != expected_range
+                            || length != Some(expected_len)
+                        {
+                            state.failures.push("upload body, content length, or sequential content range mismatch");
+                        }
+                        if std::fs::read_dir(&uploads).unwrap().next().is_some() {
+                            state.failures.push("upload spool was not unlinked");
+                        }
+                        state.active -= 1;
+                        state.bytes += received;
+                        state.chunks.push((range.to_string(), received));
+                        if fail_chunk == Some(state.chunks.len()) {
+                            (503, r#"{"error":{"code":"serviceUnavailable"}}"#.into())
+                        } else if state.bytes == total {
+                            (201, format!(
+                                r#"{{"id":"fixture-file-id","name":"large.bin","size":{total},"file":{{}},"parentReference":{{"id":"fixture-root"}},"eTag":"fixture-etag"}}"#,
+                            ))
+                        } else {
+                            (202, format!(r#"{{"nextExpectedRanges":["{}-"]}}"#, state.bytes))
+                        }
+                    } else if is_session && parts.method == http::Method::DELETE {
+                        state.cancellations += 1;
+                        (204, String::new())
+                    } else if parts.uri.path().ends_with("/createUploadSession") {
+                        state.sessions += 1;
+                        (200, r#"{"uploadUrl":"https://upload.up.1drv.com/upload-fixture"}"#.into())
+                    } else if parts.uri.path() == "/v1.0/me" {
+                        (200, r#"{"id":"fixture-account"}"#.into())
+                    } else if parts.uri.path() == "/v1.0/me/drive" {
+                        (200, r#"{"id":"fixture-drive","name":"Fixture","driveType":"business","webUrl":"https://tenant.sharepoint.com/fixture"}"#.into())
+                    } else if parts.uri.path() == "/v1.0/me/drive/root/delta" {
+                        let items = if state.deltas == 0 {
+                            r#"{"id":"fixture-root","name":"root","root":{},"folder":{}}"#
+                        } else {
+                            ""
+                        };
+                        state.deltas += 1;
+                        (200, format!(
+                            r#"{{"value":[{items}],"@odata.deltaLink":"https://graph.microsoft.com/v1.0/me/drive/root/delta?fixture=unchanged"}}"#,
+                        ))
+                    } else {
+                        state.failures.push("unexpected Graph request");
+                        (500, "{}".into())
+                    };
+                    Ok::<_, hyper::Error>(Response::builder().status(status)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Full::new(Bytes::from(json))).unwrap())
+                }
+            }).await;
+            let engine = build_engine().unwrap();
+            let pre = load_pre(&engine, &component_path).await.unwrap();
+            let config = HostConfig {
+                component_path,
+                state_dir: root.clone(),
+                account_dir: None,
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+            };
+            let guest_env = GuestEnv {
+                entries: Arc::new(vec![
+                    (
+                        "ONEDRIVE_BASIC_AUTH_SECRET".into(),
+                        "abcdefghijklmnopqrstuvwxyz123456".into(),
+                    ),
+                    (
+                        "ONEDRIVE_MAX_UPLOAD_BYTES".into(),
+                        (128 * 1024 * 1024).to_string(),
+                    ),
+                    ("ONEDRIVE_PERF_LOG".into(), "1".into()),
+                ]),
+            };
+            let mut server = HostServer::new(pre, engine, config, guest_env);
+            server.mock_peer = Some(graph.peer);
+            Self {
+                server,
+                _graph: graph,
+                observed,
+                root,
+            }
+        }
+
+        async fn request(
+            &self,
+            method: &str,
+            path: &str,
+            body: Bytes,
+        ) -> (StatusCode, http::HeaderMap, Bytes) {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(format!("http://localhost{path}"))
+                .header(
+                    "authorization",
+                    "Basic dTphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejEyMzQ1Ng==",
+                );
+            if path == "/_sync" {
+                request = request.header("x-onedrive-sync", "1");
+            } else if path.starts_with("/_") {
+                request = request.header("x-onedrive-plugin", "1");
+            }
+            let request = request.body(Full::new(body)).unwrap();
+            let mut store = self.server.build_store(false).unwrap();
+            let request = store
+                .data_mut()
+                .http()
+                .new_incoming_request(Scheme::Http, request)
+                .unwrap();
+            let (sender, receiver) = oneshot::channel();
+            let out = store
+                .data_mut()
+                .http()
+                .new_response_outparam(sender)
+                .unwrap();
+            let execute = async {
+                let proxy = self.server.pre.instantiate_async(&mut store).await.unwrap();
+                proxy
+                    .wasi_http_incoming_handler()
+                    .call_handle(store, request, out)
+                    .await
+                    .unwrap();
+            };
+            let response = async {
+                let response = receiver.await.unwrap().unwrap();
+                let (parts, body) = response.into_parts();
+                (
+                    parts.status,
+                    parts.headers,
+                    body.collect().await.unwrap().to_bytes(),
+                )
+            };
+            tokio::time::timeout(Duration::from_secs(120), async {
+                let ((), response) = tokio::join!(execute, response);
+                response
+            })
+            .await
+            .expect("real WASI request/response body execution must not deadlock")
+        }
+
+        fn assert_no_spool(&self) {
+            assert!(
+                std::fs::read_dir(self.root.join(".uploads"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            #[cfg(target_os = "linux")]
+            for descriptor in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+                if let Ok(target) = std::fs::read_link(descriptor.path()) {
+                    assert!(
+                        !target.starts_with(self.root.join(".uploads")),
+                        "spool descriptor retained"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ONEDRIVE_TEST_COMPONENT pointing to a freshly built WASIp2 guest"]
+    async fn real_component_upload_and_unchanged_sync_body_progress() {
+        const TOTAL: usize = 65 * 1024 * 1024 + 17;
+        let component = PathBuf::from(
+            std::env::var_os("ONEDRIVE_TEST_COMPONENT")
+                .expect("select a freshly built guest using ONEDRIVE_TEST_COMPONENT"),
+        );
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let fixture = ComponentFixture::new(component, TOTAL, None).await;
+        let (status, _, body) = fixture.request("POST", "/_sync", Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let payload = Bytes::from(
+            (0..TOTAL)
+                .map(|offset| (offset % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let started = Instant::now();
+        let (status, _, body) = fixture.request("PUT", "/large.bin", payload).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}; mock state: {:?}",
+            String::from_utf8_lossy(&body),
+            fixture.observed.lock().unwrap(),
+        );
+        {
+            let state = fixture.observed.lock().unwrap();
+            assert!(state.failures.is_empty(), "{state:?}");
+            assert_eq!(state.sessions, 1);
+            assert_eq!(state.cancellations, 0);
+            assert_eq!(state.bytes, TOTAL);
+            assert_eq!(state.max_active, 1);
+            assert_eq!(state.chunks.len(), 7);
+            assert_eq!(state.chunks.last().unwrap().1, 5 * 1024 * 1024 + 17);
+        }
+        fixture.assert_no_spool();
+        let (status, _, body) = fixture
+            .request("GET", "/_tree?path=/large.bin", Bytes::new())
+            .await;
+        let metadata = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(status, StatusCode::OK, "{metadata}");
+        assert!(
+            metadata.contains(&format!("\"size\":{TOTAL}")),
+            "{metadata}"
+        );
+        assert!(metadata.contains("\"etag\":\"fixture-etag\""), "{metadata}");
+        assert!(metadata.contains("\"isDir\":false"), "{metadata}");
+        assert!(metadata.contains("\"source\":\"index\""), "{metadata}");
+
+        // Corrupt only the directory table, leaving header+metadata intact.
+        // Unchanged ticks must succeed without decoding this full namespace.
+        let path = fixture.root.join("index.bin");
+        let mut snapshot = std::fs::read(&path).unwrap();
+        let table = u64::from_le_bytes(snapshot[8..16].try_into().unwrap()) as usize;
+        snapshot[table..table + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &snapshot).unwrap();
+        for _ in 0..2 {
+            let (status, _, body) = fixture.request("POST", "/_sync", Bytes::new()).await;
+            let report = String::from_utf8(body.to_vec()).unwrap();
+            assert_eq!(status, StatusCode::OK, "{report}");
+            assert!(
+                report.contains("\"snapshot_load_skipped\":true"),
+                "{report}"
+            );
+            for stage in [
+                "binding_ms",
+                "snapshot_load_ms",
+                "delta_ms",
+                "apply_ms",
+                "snapshot_save_ms",
+            ] {
+                assert!(report.contains(&format!("\"{stage}\":")), "{report}");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), snapshot);
+        }
+        let (status, _, body) = fixture.request("GET", "/_status", Bytes::new()).await;
+        let report = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert!(
+            report.contains("\"snapshot_load_skipped\":true"),
+            "{report}"
+        );
+        assert!(fixture.observed.lock().unwrap().failures.is_empty());
+        println!(
+            "real_wasi_upload bytes={TOTAL} chunks=7 elapsed_ms={} repeated_nochange_syncs=2 full_snapshot_loads=0",
+            started.elapsed().as_millis()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ONEDRIVE_TEST_COMPONENT pointing to a freshly built WASIp2 guest"]
+    async fn real_component_failed_chunk_cancels_without_replay_or_snapshot_mutation() {
+        const TOTAL: usize = 25 * 1024 * 1024 + 17;
+        let component = PathBuf::from(
+            std::env::var_os("ONEDRIVE_TEST_COMPONENT")
+                .expect("select a freshly built guest using ONEDRIVE_TEST_COMPONENT"),
+        );
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let fixture = ComponentFixture::new(component, TOTAL, Some(2)).await;
+        let (status, _, body) = fixture.request("POST", "/_sync", Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let snapshot = std::fs::read(fixture.root.join("index.bin")).unwrap();
+        let payload = Bytes::from(
+            (0..TOTAL)
+                .map(|offset| (offset % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (status, _, body) = fixture.request("PUT", "/large.bin", payload).await;
+        let error = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+        assert!(
+            error.contains("HTTP 503"),
+            "{error}; {:?}",
+            fixture.observed.lock().unwrap()
+        );
+        {
+            let state = fixture.observed.lock().unwrap();
+            assert!(state.failures.is_empty(), "{state:?}");
+            assert_eq!(state.sessions, 1);
+            assert_eq!(state.chunks.len(), 2);
+            assert_eq!(state.bytes, 20 * 1024 * 1024);
+            assert_eq!(state.cancellations, 1);
+            assert_eq!(state.max_active, 1);
+        }
+        assert_eq!(
+            std::fs::read(fixture.root.join("index.bin")).unwrap(),
+            snapshot
+        );
+        fixture.assert_no_spool();
+    }
+
+    #[tokio::test]
+    async fn pooled_requests_drive_streaming_bodies_and_reuse_connections() {
+        struct StreamingBody {
+            frame: usize,
+            pending: bool,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Body for StreamingBody {
+            type Data = Bytes;
+            type Error = WasiHttpError;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Bytes>, WasiHttpError>>>
+            {
+                if self.frame == 4 {
+                    return std::task::Poll::Ready(None);
+                }
+                if !self.pending {
+                    self.pending = true;
+                    cx.waker().wake_by_ref();
+                    return std::task::Poll::Pending;
+                }
+                self.pending = false;
+                self.frame += 1;
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from(vec![
+                    b'x';
+                    32 * 1024
+                ])))))
+            }
+        }
+        impl Drop for StreamingBody {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let server = TestServer::start().await;
+        let client = test_client(1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        for _ in 0..3 {
+            let body = StreamingBody {
+                frame: 0,
+                pending: false,
+                dropped: dropped.clone(),
+            };
+            let received = server.round_trip(&client, body.boxed_unsync()).await;
+            assert_eq!(received.len(), 128 * 1024);
+            assert!(received.iter().all(|byte| *byte == b'x'));
+            assert_eq!(client.idle.lock().unwrap().len(), 1);
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 3);
+        assert_eq!(server.accepted.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn abandoned_responses_and_cancelled_io_are_not_reused() {
+        let server = TestServer::start().await;
+        let client = test_client(1);
+        for cancel_io in [false, true] {
+            let request = Request::builder()
+                .uri("/echo")
+                .body(test_body(b"body"))
+                .unwrap();
+            let (response, io) = send_on_connection(
+                client.clone(),
+                "graph.microsoft.com".into(),
+                server.connection().await,
+                request,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            assert!(client.idle.lock().unwrap().is_empty());
+            drop(response);
+            if cancel_io {
+                drop(io);
+            } else {
+                tokio::time::timeout(Duration::from_secs(2), io)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(client.idle.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_connection_close_is_not_pooled() {
+        let server = TestServer::start().await;
+        let client = test_client(1);
+        let request = Request::builder()
+            .uri("/close")
+            .body(test_body(b"fixture"))
+            .unwrap();
+        let (response, io) = send_on_connection(
+            client.clone(),
+            "graph.microsoft.com".into(),
+            server.connection().await,
+            request,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let (body, result) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(response.into_body().collect(), io)
+        })
+        .await
+        .unwrap();
+        assert_eq!(body.unwrap().to_bytes(), "fixture");
+        result.unwrap();
+        assert!(client.idle.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_idle_connections_are_discarded_before_sending() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(peer).await.unwrap();
+        let (remote, _) = listener.accept().await.unwrap();
+        let (sender, io) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        let client = test_client(1);
+        client.put(
+            "graph.microsoft.com".into(),
+            PooledConnection {
+                sender,
+                io: Box::pin(io),
+                peer,
+                created: Instant::now(),
+            },
+        );
+        drop(remote);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(client.take("graph.microsoft.com", peer).await.is_none());
+        assert!(client.idle.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pool_respects_host_peer_expiry_and_capacity_boundaries() {
+        let server = TestServer::start().await;
+        let client = test_client(1);
+        client.put("graph.microsoft.com".into(), server.connection().await);
+        client.put("graph.microsoft.com".into(), server.connection().await);
+        assert_eq!(client.idle.lock().unwrap().len(), 1);
+        assert!(
+            client
+                .take("login.microsoftonline.com", server.peer)
+                .await
+                .is_none()
+        );
+        let other_peer = SocketAddr::from(([127, 0, 0, 1], 1));
+        assert!(
+            client
+                .take("graph.microsoft.com", other_peer)
+                .await
+                .is_none()
+        );
+        client.idle.lock().unwrap()[0].idle_since -= OUTBOUND_IDLE_TIMEOUT;
+        assert!(
+            client
+                .take("graph.microsoft.com", server.peer)
+                .await
+                .is_none()
+        );
+        let mut old = server.connection().await;
+        old.created -= OUTBOUND_CONNECTION_LIFETIME;
+        client.put("graph.microsoft.com".into(), old);
+        assert!(client.idle.lock().unwrap().is_empty());
+        for index in 0..OUTBOUND_IDLE_LIMIT + 2 {
+            client.put(
+                format!("tenant{index}.sharepoint.com"),
+                server.connection().await,
+            );
+        }
+        assert_eq!(client.idle.lock().unwrap().len(), OUTBOUND_IDLE_LIMIT);
+        let disabled = test_client(0);
+        disabled.put("graph.microsoft.com".into(), server.connection().await);
+        assert!(disabled.idle.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated HTTP benchmark; run explicitly with --ignored --nocapture"]
+    async fn benchmark_isolated_http_pool() {
+        const REQUESTS: usize = 200;
+        for idle_per_host in [0, 1] {
+            let server = TestServer::start().await;
+            let client = test_client(idle_per_host);
+            let start = Instant::now();
+            for _ in 0..REQUESTS {
+                assert_eq!(
+                    server.round_trip(&client, test_body(b"fixture")).await,
+                    "fixture"
+                );
+            }
+            let elapsed = start.elapsed();
+            let connections = server.accepted.load(Ordering::Relaxed);
+            assert_eq!(connections, if idle_per_host == 0 { REQUESTS } else { 1 });
+            println!(
+                "isolated_http pool_idle_per_host={idle_per_host} requests={REQUESTS} connections={connections} elapsed_us={}",
+                elapsed.as_micros(),
+            );
         }
     }
 

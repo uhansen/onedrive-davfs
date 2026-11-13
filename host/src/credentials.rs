@@ -1,12 +1,46 @@
 use anyhow::{Context, Result, bail};
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{DirBuilder, File, OpenOptions, Permissions, TryLockError};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const PENDING: &str = ".pending-token";
+
+pub fn prepare_upload_directory(state_dir: &Path) -> Result<File> {
+    unsafe extern "C" {
+        fn geteuid() -> std::os::raw::c_uint;
+    }
+    // POSIX geteuid has no preconditions or failure return.
+    let uid = unsafe { geteuid() };
+    let path = state_dir.join(".uploads");
+    match DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("failed to create private upload directory"),
+    }
+    let expected = std::fs::symlink_metadata(&path)?;
+    if !expected.is_dir() || expected.uid() != uid {
+        bail!("upload directory must be a real directory owned by the effective user");
+    }
+    let directory = File::open(&path)?;
+    let opened = directory.metadata()?;
+    if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+        bail!("upload directory changed while opening it");
+    }
+    // Change the verified inode, not a path that could have been replaced.
+    directory.set_permissions(Permissions::from_mode(0o700))?;
+    let current = std::fs::symlink_metadata(&path)?;
+    if !current.is_dir()
+        || current.dev() != opened.dev()
+        || current.ino() != opened.ino()
+        || current.uid() != uid
+    {
+        bail!("upload directory changed while securing it");
+    }
+    Ok(directory)
+}
 
 pub fn mirror_current(state_dir: &Path, account_dir: Option<&Path>) -> Result<bool> {
     let Some(account_dir) = account_dir else {
@@ -147,13 +181,57 @@ mod tests {
     use super::*;
 
     fn fixture() -> PathBuf {
-        let directory = std::env::temp_dir().join(format!(
-            "onedrive-credentials-{}-{}",
-            std::process::id(),
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "onedrive-credentials-{}-{}",
+                std::process::id(),
+                TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
         std::fs::create_dir(&directory).unwrap();
         directory
+    }
+
+    #[test]
+    fn upload_directory_is_private_without_changing_state_permissions() {
+        let root = fixture();
+        std::fs::set_permissions(&root, Permissions::from_mode(0o755)).unwrap();
+        let upload_dir = prepare_upload_directory(&root).unwrap();
+        assert_eq!(
+            upload_dir.metadata().unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            root.metadata().unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        std::fs::set_permissions(root.join(".uploads"), Permissions::from_mode(0o777)).unwrap();
+        let reopened = prepare_upload_directory(&root).unwrap();
+        assert_eq!(
+            reopened.metadata().unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn upload_directory_rejects_symlinks_and_regular_files() {
+        let root = fixture();
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, Permissions::from_mode(0o755)).unwrap();
+        let uploads = root.join(".uploads");
+        std::os::unix::fs::symlink(&target, &uploads).unwrap();
+        assert!(prepare_upload_directory(&root).is_err());
+        assert_eq!(
+            target.metadata().unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        std::fs::remove_file(&uploads).unwrap();
+        std::fs::write(&uploads, b"not a directory").unwrap();
+        assert!(prepare_upload_directory(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

@@ -159,6 +159,24 @@ fn propfind_from_index(config: &Config, path: &str, depth: Option<&str>) -> Opti
     Some(DavResponse::xml(207, xml::multistatus(&entries)))
 }
 
+pub fn propfind_cached(config: &Config, path: &str, depth: Option<&str>) -> DavResponse {
+    if depth == Some("infinity") {
+        return propfind(config, path, depth);
+    }
+    propfind_from_index(config, path, depth).unwrap_or_else(|| {
+        DavResponse::error(
+            503,
+            "directory index unavailable; retry after synchronization",
+        )
+    })
+}
+
+pub fn head_cached(config: &Config, path: &str) -> DavResponse {
+    head_from_index(config, path).unwrap_or_else(|| {
+        DavResponse::error(503, "item index unavailable; retry after synchronization")
+    })
+}
+
 fn entry_from_info(path: &str, info: &ChildInfo, is_self: bool) -> DavEntry {
     let href = if is_self {
         if path.trim_matches('/').is_empty() {
@@ -273,14 +291,13 @@ fn apply_or_upsert(
     idx.upsert_at_path(path, meta)
 }
 
-pub fn put(config: &Config, path: &str, body: &[u8]) -> DavResponse {
-    if body.len() as u64 > graph::MAX_UPLOAD_BYTES {
+pub fn put(config: &Config, path: &str, body: &crate::upload::Upload) -> DavResponse {
+    if body.size > config.max_upload_bytes {
         return DavResponse::error(
             413,
             format!(
                 "file is {} bytes; this build only supports uploads up to {} bytes",
-                body.len(),
-                graph::MAX_UPLOAD_BYTES
+                body.size, config.max_upload_bytes
             ),
         );
     }
@@ -293,7 +310,7 @@ pub fn put(config: &Config, path: &str, body: &[u8]) -> DavResponse {
                     path,
                     ItemMeta {
                         is_dir: false,
-                        size: body.len() as u64,
+                        size: body.size,
                         mtime: 0,
                         etag: String::new(),
                     },

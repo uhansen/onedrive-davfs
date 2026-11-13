@@ -99,6 +99,7 @@ pub fn status(config: &Config) -> DavResponse {
             "pages": tick.pages,
             "complete": tick.complete,
             "durationMs": tick.duration_ms,
+            "timings": tick.timings,
             "resync": tick.resync,
             "itemsPerSec": tick.items_per_sec,
             "at": tick.at,

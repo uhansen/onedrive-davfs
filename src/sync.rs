@@ -8,7 +8,7 @@ use crate::graph::{self, DeltaError};
 use crate::index::{DriveBinding, Index};
 use crate::snapshot::{self, INDEX_FILE, REBUILD_FILE};
 use crate::state_file;
-use crate::sync_stats::{self, SyncStats};
+use crate::sync_stats::{self, SyncStats, SyncTimings};
 
 pub fn run(config: &Config) -> DavResponse {
     if !config.index_enabled {
@@ -55,9 +55,60 @@ fn now_ms() -> u64 {
 fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
     let started = now_ms();
     let current_binding = graph::current_drive_binding(config)?;
-    let live = snapshot::load(&config.state_dir, INDEX_FILE)?;
-    let rebuild = snapshot::load(&config.state_dir, REBUILD_FILE)?;
+    let mut timings = SyncTimings {
+        binding_ms: now_ms().saturating_sub(started),
+        ..SyncTimings::default()
+    };
+    let load_started = now_ms();
     let live_meta = snapshot::read_meta(&config.state_dir)?;
+    let can_probe = live_meta.as_ref().is_some_and(|meta| {
+        meta.crawl_complete
+            && meta.pending_next_link.is_none()
+            && meta.delta_token.is_some()
+            && meta.root_id.is_some()
+            && meta.built_at != 0
+            && meta.total_dirs != 0
+            && meta.binding.as_ref() == Some(&current_binding)
+    }) && !state_file::exists(&config.state_dir, REBUILD_FILE)?;
+    let probe_started = now_ms();
+    let mut first_page = if can_probe {
+        Some(graph::delta(
+            config,
+            live_meta.as_ref().unwrap().delta_token.as_ref().unwrap(),
+        ))
+    } else {
+        None
+    };
+    timings.delta_ms = now_ms().saturating_sub(probe_started);
+    let unchanged = match (live_meta.as_ref(), first_page.as_ref()) {
+        (Some(meta), Some(Ok(page))) => unchanged_delta(meta, page),
+        _ => false,
+    };
+    // Identity is still revalidated every tick. Only a genuinely unchanged
+    // complete cursor can skip decoding the full namespace.
+    let (live, rebuild) = if unchanged {
+        let meta = live_meta.as_ref().unwrap();
+        (
+            Some(Index {
+                binding: meta.binding.clone(),
+                root: meta.root_id.clone(),
+                delta_token: meta.delta_token.clone(),
+                generation: meta.generation,
+                crawl_complete: true,
+                ..Index::default()
+            }),
+            None,
+        )
+    } else {
+        (
+            snapshot::load(&config.state_dir, INDEX_FILE)?,
+            snapshot::load(&config.state_dir, REBUILD_FILE)?,
+        )
+    };
+    timings.snapshot_load_ms = now_ms()
+        .saturating_sub(load_started)
+        .saturating_sub(timings.delta_ms);
+    timings.snapshot_load_skipped = unchanged;
     let has_live = live
         .as_ref()
         .is_some_and(|idx| idx.crawl_complete || idx.root.is_some());
@@ -120,7 +171,17 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
         if now_ms().saturating_sub(started) >= config.sync_budget_ms && pages > 0 {
             break;
         }
-        match graph::delta(config, &url) {
+        let delta_started = now_ms();
+        let page = match first_page.take() {
+            Some(page) => page,
+            None => {
+                let page = graph::delta(config, &url);
+                timings.delta_ms += now_ms().saturating_sub(delta_started);
+                page
+            }
+        };
+        let apply_started = now_ms();
+        match page {
             Ok(page) => {
                 pages += 1;
                 if !page.items.is_empty() {
@@ -149,8 +210,11 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
                             idx.delta_token = Some(token);
                         }
                         idx.crawl_complete = true;
-                        idx.sweep_orphans();
+                        if !unchanged {
+                            idx.sweep_orphans();
+                        }
                         complete = true;
+                        timings.apply_ms += now_ms().saturating_sub(apply_started);
                         break;
                     }
                 }
@@ -173,8 +237,10 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
             }
             Err(DeltaError::Other(e)) => return Err(e),
         }
+        timings.apply_ms += now_ms().saturating_sub(apply_started);
     }
 
+    let save_started = now_ms();
     if dirty {
         snapshot::save(&config.state_dir, target, &idx)?;
     }
@@ -188,6 +254,8 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
         state_file::rename(&config.state_dir, REBUILD_FILE, INDEX_FILE)?;
         target = INDEX_FILE;
     }
+    timings.snapshot_save_ms = now_ms().saturating_sub(save_started);
+    let timings = config.perf_log.then_some(timings);
 
     let duration_ms = now_ms().saturating_sub(started);
     let items_per_sec = if duration_ms > 0 {
@@ -206,6 +274,7 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
         at: now_secs(),
         has_token: idx.delta_token.is_some(),
         target: target.to_string(),
+        timings: timings.clone(),
     };
     sync_stats::save(&config.state_dir, &stats)?;
     sync_stats::clear_failure(config)?;
@@ -229,7 +298,15 @@ fn run_inner(config: &Config) -> Result<serde_json::Value, String> {
         "resync": resync,
         "target": target,
         "items_per_sec": items_per_sec,
+        "timings": timings,
     }))
+}
+
+fn unchanged_delta(meta: &snapshot::SnapshotMeta, page: &graph::DeltaPage) -> bool {
+    page.items.is_empty()
+        && page.next_link.is_none()
+        && page.delta_token.is_some()
+        && page.delta_token == meta.delta_token
 }
 
 fn existing_binding_mismatch(
@@ -259,6 +336,49 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_identical_empty_final_delta_can_skip_loading_snapshot() {
+        let meta = snapshot::SnapshotMeta {
+            binding: None,
+            delta_token: Some("cursor".into()),
+            pending_next_link: None,
+            crawl_complete: true,
+            generation: 1,
+            built_at: 1,
+            root_id: Some("root".into()),
+            total_dirs: 1,
+            total_files: 0,
+        };
+        let mut page = graph::DeltaPage {
+            items: vec![],
+            next_link: None,
+            delta_token: Some("cursor".into()),
+        };
+        assert!(unchanged_delta(&meta, &page));
+        page.delta_token = Some("new-cursor".into());
+        assert!(!unchanged_delta(&meta, &page));
+        page.delta_token = None;
+        assert!(!unchanged_delta(&meta, &page));
+        page.delta_token = Some("cursor".into());
+        page.next_link = Some("next-page".into());
+        assert!(!unchanged_delta(&meta, &page));
+        page.next_link = None;
+        page.items.push(crate::index::DeltaItem {
+            id: "removed".into(),
+            parent_id: None,
+            name: String::new(),
+            deleted: true,
+            is_root: false,
+            meta: crate::index::ItemMeta {
+                is_dir: false,
+                size: 0,
+                mtime: 0,
+                etag: String::new(),
+            },
+        });
+        assert!(!unchanged_delta(&meta, &page));
+    }
 
     #[test]
     fn resync_bumps_generation_and_clears_nodes() {

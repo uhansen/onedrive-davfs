@@ -69,6 +69,18 @@ pub struct SyncStats {
     pub at: u64,
     pub has_token: bool,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<SyncTimings>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SyncTimings {
+    pub binding_ms: u64,
+    pub snapshot_load_ms: u64,
+    pub delta_ms: u64,
+    pub apply_ms: u64,
+    pub snapshot_save_ms: u64,
+    pub snapshot_load_skipped: bool,
 }
 
 impl SyncStats {

@@ -18,9 +18,6 @@ use crate::index::{DeltaItem, DriveBinding, ItemMeta};
 /// `createUploadSession` with chunked `Content-Range`.
 pub const MAX_SIMPLE_UPLOAD_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Hard ceiling on a single `PUT`: the whole body is buffered in the guest.
-pub const MAX_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
-
 /// Graph upload-session chunks must be a multiple of 320 KiB except the last.
 const UPLOAD_CHUNK_BYTES: usize = 10 * 1024 * 1024;
 
@@ -852,18 +849,21 @@ pub fn get_content(config: &Config, path: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-pub fn put_content(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaItem>, String> {
-    if bytes.len() as u64 > MAX_UPLOAD_BYTES {
+pub fn put_content(
+    config: &Config,
+    path: &str,
+    upload: &crate::upload::Upload,
+) -> Result<Option<DeltaItem>, String> {
+    if upload.size > config.max_upload_bytes {
         return Err(format!(
             "file is {} bytes, larger than this build's {}-byte upload limit",
-            bytes.len(),
-            MAX_UPLOAD_BYTES
+            upload.size, config.max_upload_bytes
         ));
     }
-    if bytes.len() as u64 > MAX_SIMPLE_UPLOAD_BYTES {
-        return put_chunked(config, path, bytes);
+    if upload.size > MAX_SIMPLE_UPLOAD_BYTES {
+        return put_chunked(config, path, upload);
     }
-    put_simple(config, path, bytes)
+    put_simple(config, path, &upload.read(0, upload.size as usize)?)
 }
 
 fn put_simple(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaItem>, String> {
@@ -892,7 +892,11 @@ struct UploadSession {
     upload_url: String,
 }
 
-fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<DeltaItem>, String> {
+fn put_chunked(
+    config: &Config,
+    path: &str,
+    upload: &crate::upload::Upload,
+) -> Result<Option<DeltaItem>, String> {
     let url = format!(
         "https://graph.microsoft.com/v1.0{}/createUploadSession",
         item_path_segment(&config.drive_base, path)
@@ -919,53 +923,79 @@ fn put_chunked(config: &Config, path: &str, bytes: &[u8]) -> Result<Option<Delta
         return Err("graph createUploadSession returned a non-https uploadUrl".to_string());
     }
 
-    let total = bytes.len();
-    let mut offset = 0;
-    let result = (|| {
-        let mut last_item = None;
-        while offset < total {
-            let end = (offset + UPLOAD_CHUNK_BYTES).min(total);
-            let chunk = &bytes[offset..end];
-            let range = format!("bytes {offset}-{}/{}", end - 1, total);
+    let result = upload_chunks(
+        upload.size,
+        |offset, len| upload.read(offset, len),
+        |chunk, range| {
             let content_length = chunk.len().to_string();
-            let sent = http_client::send(HttpRequest {
+            http_client::send(HttpRequest {
                 method: Method::Put,
                 url: &upload_url,
                 headers: &[
-                    ("content-range", range.as_str()),
+                    ("content-range", range),
                     ("content-length", content_length.as_str()),
                     ("content-type", "application/octet-stream"),
                 ],
                 body: chunk,
-            })?;
-            let last = end == total;
-            let ok = if last {
-                sent.status == 200 || sent.status == 201
-            } else {
-                sent.status == 202
-            };
-            if !ok {
-                return Err(graph_failure("Upload session chunk", &sent));
-            }
-            if last {
-                last_item = serde_json::from_slice::<DriveItem>(&sent.body)
-                    .ok()
-                    .and_then(|item| to_delta_item(&item));
-            }
-            offset = end;
-        }
-        Ok(last_item)
-    })();
+            })
+        },
+    );
 
     if result.is_err() {
-        let _ = http_client::send(HttpRequest {
+        match http_client::send(HttpRequest {
             method: Method::Delete,
             url: &upload_url,
             headers: &[],
             body: &[],
-        });
+        }) {
+            Ok(response) if matches!(response.status, 204 | 404) => {}
+            _ => {
+                return Err(format!(
+                    "{}; upload-session cancellation failed; unused session will expire",
+                    result.unwrap_err()
+                ));
+            }
+        }
     }
     result
+}
+
+fn upload_chunks(
+    total: u64,
+    mut read: impl FnMut(u64, usize) -> Result<Vec<u8>, String>,
+    mut send: impl FnMut(&[u8], &str) -> Result<http_client::HttpResponse, String>,
+) -> Result<Option<DeltaItem>, String> {
+    let mut offset = 0;
+    while offset < total {
+        let len = (total - offset).min(UPLOAD_CHUNK_BYTES as u64) as usize;
+        let chunk = read(offset, len)?;
+        if chunk.len() != len {
+            return Err("upload spool returned an incomplete chunk".into());
+        }
+        let end = offset + len as u64;
+        let response = send(&chunk, &format!("bytes {offset}-{}/{total}", end - 1))?;
+        if end == total {
+            if !matches!(response.status, 200 | 201) {
+                return Err(graph_failure("Upload session completion", &response));
+            }
+            let item: DriveItem = serde_json::from_slice(&response.body).map_err(|_| {
+                "upload completed but Graph returned invalid item metadata".to_string()
+            })?;
+            return Ok(to_delta_item(&item));
+        }
+        if response.status != 202 {
+            return Err(graph_failure("Upload session chunk", &response));
+        }
+        let progress: serde_json::Value = serde_json::from_slice(&response.body)
+            .map_err(|_| "upload session returned invalid progress".to_string())?;
+        if progress["nextExpectedRanges"][0].as_str() != Some(&format!("{end}-")) {
+            return Err(
+                "upload session progress disagrees with transmitted bytes; upload cancelled".into(),
+            );
+        }
+        offset = end;
+    }
+    Err("empty upload session".into())
 }
 
 pub fn create_folder(
@@ -1050,6 +1080,100 @@ pub fn move_or_rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_upload_is_bounded_aligned_and_sequential_with_short_final_chunk() {
+        let total = 65 * 1024 * 1024 + 17;
+        let mut offsets = vec![];
+        let mut ranges = vec![];
+        let result = upload_chunks(total, |offset, len| {
+            offsets.push(offset);
+            assert!(len <= UPLOAD_CHUNK_BYTES);
+            Ok(vec![42; len])
+        }, |bytes, range| {
+            ranges.push(range.to_string());
+            assert!(bytes.iter().all(|byte| *byte == 42));
+            let end = range.split(['-', '/']).nth(1).unwrap().parse::<u64>().unwrap() + 1;
+            let last = end == total;
+            if !last {
+                assert_eq!(bytes.len() % (320 * 1024), 0);
+            }
+            Ok(http_client::HttpResponse {
+                status: if last { 201 } else { 202 }, headers: vec![],
+                body: if last {
+                    br#"{"id":"uploaded","name":"fixture","size":68157457,"file":{},"parentReference":{"id":"root"}}"#.to_vec()
+                } else {
+                    format!(r#"{{"nextExpectedRanges":["{end}-"]}}"#).into_bytes()
+                },
+            })
+        }).unwrap();
+        assert!(result.is_some());
+        assert_eq!(offsets.len(), 7);
+        assert_eq!(offsets[6], 60 * 1024 * 1024);
+        assert_eq!(
+            ranges[6],
+            format!("bytes {}-{}/{total}", offsets[6], total - 1)
+        );
+    }
+
+    #[test]
+    fn upload_failures_stop_without_unsafe_replay() {
+        for status in [429, 500, 503, 200] {
+            let mut requests = 0;
+            let result = upload_chunks(
+                UPLOAD_CHUNK_BYTES as u64 + 1,
+                |_, len| Ok(vec![0; len]),
+                |_, _| {
+                    requests += 1;
+                    Ok(http_client::HttpResponse {
+                        status,
+                        headers: vec![],
+                        body: b"{}".to_vec(),
+                    })
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(requests, 1);
+        }
+        let mut requests = 0;
+        let result = upload_chunks(
+            1,
+            |_, _| Ok(vec![]),
+            |_, _| {
+                requests += 1;
+                unreachable!()
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(requests, 0);
+    }
+
+    #[test]
+    fn unexpected_upload_progress_and_invalid_completion_are_errors() {
+        for (total, status, body) in [
+            (
+                UPLOAD_CHUNK_BYTES as u64 + 1,
+                202,
+                br#"{"nextExpectedRanges":["0-"]}"#.as_slice(),
+            ),
+            (1, 201, b"not-json".as_slice()),
+        ] {
+            assert!(
+                upload_chunks(
+                    total,
+                    |_, len| Ok(vec![0; len]),
+                    |_, _| {
+                        Ok(http_client::HttpResponse {
+                            status,
+                            headers: vec![],
+                            body: body.to_vec(),
+                        })
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn enterprise_errors_are_actionable_without_echoing_payloads() {

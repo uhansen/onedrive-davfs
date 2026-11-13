@@ -45,7 +45,8 @@ Implemented, against the real Microsoft Graph API:
 
 - `PROPFIND` (Depth 0/1; `Depth: infinity` is refused with `403` +
   `propfind-finite-depth` per RFC 4918)
-- `GET`, `PUT` (buffered, up to 64 MiB; uploads above 4 MiB use sessions)
+- `GET` (buffered), `PUT` (disk-spooled, 64 MiB default limit;
+  configurable with `ONEDRIVE_MAX_UPLOAD_BYTES`; uploads above 4 MiB use sessions)
 - `MKCOL`, `DELETE`, `MOVE`
 - `LOCK`/`UNLOCK` (fixed no-op success responses -- enough to satisfy
   davfs2's locking requirement for a single-writer mount; Graph has no
@@ -62,7 +63,7 @@ Implemented, against the real Microsoft Graph API:
   `onedrive-davfs-sync.timer` every 30s. Local `PUT`/`MKCOL`/`DELETE`/`MOVE`
   patch the snapshot immediately. `ONEDRIVE_INDEX_ENABLED=0` restores
   live Graph listings. A miss or corrupt snapshot always falls back to
-  Graph, so a bad index cannot break the mount.
+  Graph, unless the optional cache-only WebDAV lane below is enabled.
 - Plugin JSON endpoints, gated on `GET` + `X-OneDrive-Plugin: 1` (davfs2
   never sends this header, so OneDrive folders named `_status`/`_tree`/`_search`
   stay reachable as WebDAV):
@@ -278,6 +279,61 @@ ONEDRIVE_TEST_COMPONENT="$PWD/target/wasm32-wasip2/release/onedrive_davfs.wasm" 
 python3 -m unittest discover -s tools -p 'test_host_component.py'
 ```
 
+For upload limits, disconnect cleanup and opt-in metadata concurrency, use
+the same artifact environment with `-p 'test_performance.py'`. All credentials,
+state and host processes are disposable; these tests do not contact Microsoft.
+Host tests selected with `ONEDRIVE_TEST_COMPONENT` also exercise the real guest
+against a test-only mock Graph transport; production outbound policy is unchanged.
+
+Isolated performance measurements (not cloud throughput):
+
+```sh
+python3 tools/benchmark_backend.py \
+  --host "$PWD/host/target/release/onedrive-davfs-host" \
+  --component "$PWD/target/wasm32-wasip2/release/onedrive_davfs.wasm" \
+  --cached-dav-reads --large-upload
+cargo test --locked --release benchmark_representative_snapshot -- --ignored --nocapture
+```
+
+The HTTP fixture measures credential-lock queueing and upload intake only:
+it deliberately lacks a usable Microsoft client ID. The representative
+snapshot fixture contains 32,278 files and 2,138 directories.
+
+## Optional performance settings
+
+Defaults retain serialized writes/sync and existing polling. HTTPS connections
+are reused within a bounded idle pool; request policy and DNS checks still
+apply and failed mutations are never blindly replayed. Outgoing request bodies
+respect WASI write permits and flush once, rather than every 4 KiB.
+
+- `ONEDRIVE_PERF_LOG=1`: privacy-safe queue, credential and network timings in
+  host logs; successful sync stages in authenticated status. No paths, URLs,
+  account names or tokens in timing records. Other logs/status still require
+  review before sharing.
+- `ONEDRIVE_HTTP_POOL_IDLE_PER_HOST`: default 1, range 0-4 (0 disables reuse).
+  There are at most eight idle connections globally; idle expiry is 15 seconds
+  and absolute connection lifetime is 60 seconds, checked lazily on reuse.
+- `ONEDRIVE_MAX_UPLOAD_BYTES`: explicit per-upload disk limit, default
+  67,108,864 (64 MiB), accepted range 1 byte to 250 GiB. Upload intake uses
+  private unlinked files under `/state/.uploads` (0700), then sequential
+  10 MiB Graph chunks. Unknown-length bodies are bounded, incomplete input
+  fails before creating a cloud session, and normal chunk failures cancel
+  sessions. A host crash/trap closes the local spool; uncancelled remote
+  sessions expire at Microsoft. No restart-resume or automatic mutation retry.
+  Disk availability, quota, network speed and the existing approximately
+  five-minute request budget still constrain large uploads.
+- `ONEDRIVE_CACHED_DAV_READS=1`: opt-in, network-denied HEAD/PROPFIND lane
+  while the writer is busy. Cache misses or stale credentials return 503,
+  never a network fallback. Leave disabled for applications requiring live
+  lookup of uncached names. It does not parallelize transfers or mutations.
+
+Unchanged, complete delta cursors can skip full snapshot decode; account and
+drive identity checks still run first. Changed cursors, pending rebuilds,
+legacy metadata or identity changes use the full path.
+
+The Omarchy plugin's `SETUP.md` documents optional timer/davfs tuning with its
+render-only Bash script; no installed settings are changed automatically.
+
 Manual smoke test once a token is in place (the daemon refuses to start
 without a real shared secret, so pass one here too):
 
@@ -335,9 +391,10 @@ curl -u "daemon:$SECRET" -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8765/
   bodies are relayed to the client as `502` text but never include the
   `Authorization` header or token endpoint payloads.
 - Request bodies are only read for `PUT` (`PROPFIND`/`LOCK` bodies are
-  ignored, so there is no XML parsing surface). `PUT` is buffered up to
-  64 MiB; files above this implementation's 4 MiB simple-upload threshold use a
-  `createUploadSession` with chunked `Content-Range` PUTs.
+  ignored, so there is no XML parsing surface). `PUT` is spooled to private,
+  unlinked disk files up to an explicit limit (64 MiB by default); files above
+  the 4 MiB simple-upload threshold use a `createUploadSession` with bounded
+  sequential `Content-Range` PUTs.
 - **Large downloads still buffer inside the guest.** The current WebDAV `GET`
   path still materializes the full Graph response body in guest memory before
   replying. The host therefore sets an explicit WebAssembly memory ceiling,

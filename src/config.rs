@@ -24,6 +24,8 @@ pub struct Config {
     pub index_enabled: bool,
     pub sync_max_pages: usize,
     pub sync_budget_ms: u64,
+    pub max_upload_bytes: u64,
+    pub perf_log: bool,
 }
 
 pub const DEFAULT_AUTH_SCOPES: &str = "offline_access Files.ReadWrite.All User.Read";
@@ -87,6 +89,7 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(20_000)
             .max(1);
+        let max_upload_bytes = upload_limit(env("ONEDRIVE_MAX_UPLOAD_BYTES").as_deref())?;
 
         let mut state_dir = None;
         for (descriptor, path) in preopens::get_directories() {
@@ -108,7 +111,39 @@ impl Config {
             index_enabled,
             sync_max_pages,
             sync_budget_ms,
+            max_upload_bytes,
+            perf_log: env("ONEDRIVE_PERF_LOG").as_deref() == Some("1"),
         })
+    }
+}
+
+fn upload_limit(raw: Option<&str>) -> Result<u64, String> {
+    let value = match raw {
+        None => 64 * 1024 * 1024,
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| "ONEDRIVE_MAX_UPLOAD_BYTES must be an integer".to_string())?,
+    };
+    if value == 0 || value > 250 * 1024 * 1024 * 1024 {
+        return Err("ONEDRIVE_MAX_UPLOAD_BYTES must be between 1 and 250 GiB".into());
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod upload_limit_tests {
+    use super::*;
+
+    #[test]
+    fn conservative_upload_default_and_explicit_large_uploads() {
+        assert_eq!(upload_limit(None).unwrap(), 64 * 1024 * 1024);
+        assert_eq!(
+            upload_limit(Some("1073741824")).unwrap(),
+            1024 * 1024 * 1024
+        );
+        for raw in ["0", "-1", "invalid", "268435456001"] {
+            assert!(upload_limit(Some(raw)).is_err());
+        }
     }
 }
 
